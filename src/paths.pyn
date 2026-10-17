@@ -1,0 +1,19 @@
+# absolute paths from the repo root, so scripts, tests and notebooks find data/ from any cwd
+from pathlib import Path
+
+
+def repo_root() -> Path:
+    # walk up from this file to the folder holding pyproject.toml
+    for d in Path(__file__).parents:
+        if (d / "pyproject.toml").exists():
+            return d
+    raise RuntimeError("no pyproject.toml found above " + __file__)
+
+
+ROOT = repo_root()
+DATA_DIR = ROOT / "data"  # gitignored
+# 72,410 Zelda frames, 128x128 RGB uint8, from the earlier world_model project
+ZELDA = ROOT.parents[1] / "ml" / "world_model" / "data" / "zelda_frames.h5"
+CKPT_DIR = ROOT / "artifacts" / "checkpoints"  # artifacts/ is gitignored
+SAMPLES_DIR = ROOT / "artifacts" / "samples"
+LOG_DIR = ROOT / "artifacts" / "logs"

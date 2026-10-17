@@ -1,0 +1,51 @@
+[project]
+name = "world-model-final"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "byname",
+    "einops>=0.8.2",
+    "h5py>=3.12",  # Zelda frames, from ../../ml/world_model/data
+    "numpy>=2.5.2",
+    "torch==2.13.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+# `uv sync` installs the project editable, and this puts these folders on every interpreter's sys.path
+# (a .pth in .venv): scripts, Alt+R, uv run, byname run, Jupyter kernels, the debugger and pytest all find
+# `paths` and friends from anywhere, as the checker does
+dev-mode-dirs = ["src"]
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true  # nothing to package: the install is only for the paths above
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.40.1",
+    # <7: ipykernel 7 reworked the kernel async/status protocol and the current VS Code Jupyter ext
+    # (2025.9.1) can miss the reply that ends a cell -- outputs land but the spinner never resolves
+    "ipykernel>=6.29,<7",
+    "matplotlib>=3.11.2",
+    "pytest>=9.1.1",
+    "ruff>=0.16.2",
+]
+
+[tool.uv.sources]
+byname = { path = "../byname", editable = true }
+
+[tool.ruff]
+# keep in step with dev-mode-dirs and extraPaths
+src = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+markers = ["slow: seconds, not milliseconds -- skip with -m 'not slow'"]
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+extraPaths = ["src"]

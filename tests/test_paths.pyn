@@ -1,0 +1,10 @@
+# the repo root is found from any cwd, and the Zelda frames are where paths says
+from paths import ROOT, ZELDA
+
+
+def test_root_holds_pyproject():
+    assert (ROOT / "pyproject.toml").exists()
+
+
+def test_zelda_frames_are_there():
+    assert ZELDA.exists(), f"expected the earlier project's frames at {ZELDA}"
