@@ -1,0 +1,35 @@
+# a perfect "model" of the synthetic world, for tests: it reads the square's
+# position from the last context frame, applies the world's rule, and returns
+# the exact velocity toward the true next frame x0. On the straight path
+# x_t = (1 - t) x0 + t noise, that velocity is (x_t - x0) / t for any t > 0, so
+# Euler sampling with it lands exactly on x0 at any number of steps
+import torch
+from einops import rearrange
+from torch import Tensor, nn
+
+import world
+from world import NOOP, SPRITE, render, sprite_center
+
+
+class Oracle(nn.Module):
+    def __init__(self, *, ignore_action: bool = False):
+        super().__init__()
+        # ignore_action: always applies noop, like a model that draws sharp
+        # frames but never listens to the keys
+        self.ignore_action = ignore_action
+        self.anchor = nn.Parameter(torch.zeros(()))  # gives the module a device
+
+    def forward(
+        self, x_t: Tensor, t: Tensor, context: Tensor, action: Tensor
+    ) -> Tensor:
+        # x_t: [B, C, H, W]
+        # t: [B]
+        # context: [B, K, C, H, W]
+        # action: [B]
+        # out: [B, C, H, W]
+        center = sprite_center(context[:, -1])  # [B, 2]
+        position = (center - (SPRITE - 1) / 2).round().long()
+        if self.ignore_action:
+            action = torch.full_like(action, NOOP)
+        x0 = render(world.step(position.cpu(), action.cpu())).to(x_t)
+        return (x_t - x0) / rearrange(t, "B -> B 1 1 1")

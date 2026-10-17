@@ -29,11 +29,16 @@ an average, and can draw content that wasn't on screen. This is how DIAMOND
    actions (noop, up, down, left, right) and stopped by the walls. Clips are
    generated on the fly, and sprite_center measures where a frame draws the
    square, which is how a model's control will be checked.
+3. Flow-matching next-frame model on the synthetic world. diffusion-final's
+   UNet (3.15M params) with the 2 previous frames stacked onto x_t as
+   channels and the action added to the time embedding. Every eval draws the
+   next frame for 200 fixed states per action: 100% control from step 500 to
+   4000, square within 0.01 px, pixels off by 0.0054 on average (under one
+   0-255 level). Peak lr 2e-3 reached 100% then collapsed; 5e-4 is stable.
+   15 minutes on the 4060. src/show_world.pyn draws a run's frames next to
+   the truth.
 
 ## Next
-3. Flow-matching next-frame model on the synthetic world: a UNet like
-   diffusion-final's, conditioned on the previous frames and the action.
-   Control accuracy measured against the exact answer; target 100%.
 4. Zelda data. Frames from the h5 file, cut into short clips, with
    self-supervised motion labels (scroll direction from FFT phase correlation,
    as in the earlier project).

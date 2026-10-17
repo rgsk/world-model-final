@@ -1,0 +1,194 @@
+# next-frame velocity predictor: (x_t, t, context frames, action) -> v.
+# ../diffusion-final's UNet with two conditioning inputs added:
+# - the context frames are stacked onto x_t as extra channels, so every pixel
+#   of the noisy next frame sits next to the same pixel of the frames before
+#   it (DIAMOND does the same)
+# - the action is embedded and added to the time embedding, so it reaches
+#   every ResBlock as a per-channel shift, as t does
+# conv in -> one ResBlock per level going down (halving H, W between levels) ->
+# two ResBlocks at the bottom -> one ResBlock per level coming up, each fed the
+# down path's output at that level (skip) -> norm, conv out
+import math
+from typing import TYPE_CHECKING
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+from torch import Tensor, nn
+
+type UNetConfig = (
+    frame_channels: int,  # 3 for RGB
+    n_context: int,  # frames before the one being drawn
+    n_actions: int,
+    channels: tuple[int, ...],  # per level, top down; len - 1 halvings of H, W
+    time_dim: int,  # width of the t + action embedding every ResBlock reads
+    groups: int,  # GroupNorm groups; must divide every entry of channels
+)
+
+# flow time is in [0, 1], but sinusoidal frequencies run from 1 down to
+# 1/MAX_PERIOD per unit of input, built for inputs in the hundreds. Scaled by
+# 1000, nearby t still land on visibly different embeddings
+TIME_SCALE = 1000.0
+MAX_PERIOD = 10000.0
+
+
+def zero_init(layer: nn.Module) -> None:
+    # weight and bias to 0, so the layer outputs 0 until training moves it
+    for p in layer.parameters():
+        nn.init.zeros_(p)
+
+
+def time_embedding(t: Tensor, dim: int) -> Tensor:
+    # t: [B], flow time in [0, 1]
+    # out: [B, dim], sin of dim/2 geometric frequencies then cos of the same
+    assert dim % 2 == 0, f"time embedding dim {dim} is odd, but sin and cos pair up"
+    half = dim // 2
+    i = torch.arange(half, device=t.device, dtype=torch.float32)  # [dim/2]
+    freqs = torch.exp(-math.log(MAX_PERIOD) * i / half)  # [dim/2], 1 -> ~1/MAX_PERIOD
+    angles = rearrange(t.float() * TIME_SCALE, "B -> B 1") * freqs  # [B, dim/2]
+    return torch.cat([angles.sin(), angles.cos()], dim=1)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, *, time_dim: int, groups: int):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(groups, in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.cond_proj = nn.Linear(time_dim, out_ch)
+        self.norm2 = nn.GroupNorm(groups, out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        # 1x1 conv when the width changes, so the skip can be added
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+        # zero init: a fresh block is just its skip, so a deep stack starts as
+        # (close to) the identity and gradients reach every level
+        zero_init(self.conv2)
+
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        # x: [B, in_ch, H, W]
+        # cond: [B, time_dim], t and the action together
+        # out: [B, out_ch, H, W]
+        h: Tensor = self.conv1(F.silu(self.norm1(x)))  # [B, out_ch, H, W]
+        # the condition as a per-channel shift, the same at every pixel
+        shift: Tensor = self.cond_proj(F.silu(cond))  # [B, out_ch]
+        h = h + rearrange(shift, "B C -> B C 1 1")
+        h = self.conv2(F.silu(self.norm2(h)))
+        skip: Tensor = self.skip(x)
+        return h + skip
+
+
+class Downsample(nn.Module):
+    def __init__(self, ch: int):
+        super().__init__()
+        self.conv = nn.Conv2d(ch, ch, 3, stride=2, padding=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, C, H, W]
+        # out: [B, C, H/2, W/2], a learned stride-2 conv rather than pooling
+        return self.conv(x)
+
+
+class Upsample(nn.Module):
+    def __init__(self, ch: int):
+        super().__init__()
+        self.conv = nn.Conv2d(ch, ch, 3, padding=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, C, H, W]
+        # out: [B, C, 2H, 2W], nearest then conv, which avoids a transposed
+        # conv's checkerboard artifacts
+        return self.conv(F.interpolate(x, scale_factor=2, mode="nearest"))
+
+
+class UNet(nn.Module):
+    def __init__(self, cfg: UNetConfig):
+        super().__init__()
+        (
+            frame_channels=, n_context=, n_actions=,
+            channels=, time_dim=, groups=,
+        ) = cfg
+        self.n_context = n_context
+        self.channels = channels
+        self.time_dim = time_dim
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_dim, time_dim), nn.SiLU(), nn.Linear(time_dim, time_dim)
+        )
+        self.action_embedding = nn.Embedding(n_actions, time_dim)
+        # x_t plus every context frame, stacked on channels
+        in_channels = frame_channels * (n_context + 1)
+        self.conv_in = nn.Conv2d(in_channels, channels[0], 3, padding=1)
+
+        # down: level i takes the previous width to channels[i]
+        self.down = nn.ModuleList()
+        ch = channels[0]
+        for out_ch in channels:
+            self.down.append(ResBlock(ch, out_ch, time_dim=, groups=))
+            ch = out_ch
+        # between levels only, so the deepest level is not halved again
+        self.downsample = nn.ModuleList([Downsample(c) for c in channels[:-1]])
+
+        self.mid1 = ResBlock(ch, ch, time_dim=, groups=)
+        self.mid2 = ResBlock(ch, ch, time_dim=, groups=)
+
+        # up: deepest level first; each block also reads that level's skip
+        self.up = nn.ModuleList()
+        for out_ch in reversed(channels):
+            self.up.append(ResBlock(ch + out_ch, out_ch, time_dim=, groups=))
+            ch = out_ch
+        self.upsample = nn.ModuleList([Upsample(c) for c in reversed(channels[1:])])
+
+        self.norm_out = nn.GroupNorm(groups, ch)
+        self.conv_out = nn.Conv2d(ch, frame_channels, 3, padding=1)
+        # zero init: a fresh model predicts v = 0 everywhere
+        zero_init(self.conv_out)
+
+    # nn.Module has no .device; all of UNet's parameters live on one device
+    @property
+    def device(self) -> torch.device:
+        return self.conv_in.weight.device
+
+    def forward(
+        self, x_t: Tensor, t: Tensor, context: Tensor, action: Tensor
+    ) -> Tensor:
+        # x_t: [B, C, H, W], the noisy next frame
+        # t: [B], flow time in [0, 1]
+        # context: [B, K, C, H, W], the K frames before it, oldest first
+        # action: [B], the action that leads from context's last frame to x0
+        # out: [B, C, H, W], the predicted velocity
+        B, K, C, H, W = context.shape
+        halvings = 2 ** (len(self.channels) - 1)
+        assert H % halvings == 0 and W % halvings == 0, (
+            f"H, W {H}x{W} must divide by {halvings} for {len(self.channels)} levels"
+        )
+        assert K == self.n_context, f"expected {self.n_context} context frames, got {K}"
+        temb: Tensor = self.time_mlp(time_embedding(t, self.time_dim))  # [B, time_dim]
+        aemb: Tensor = self.action_embedding(action)  # [B, time_dim]
+        cond = temb + aemb
+
+        flat_context = rearrange(context, "B K C H W -> B (K C) H W")
+        stacked = torch.cat([x_t, flat_context], dim=1)  # [B, C (K + 1), H, W]
+        h: Tensor = self.conv_in(stacked)  # [B, channels[0], H, W]
+        skips: list[Tensor] = []
+        for i, block in enumerate(self.down):
+            h = block(h, cond)  # [B, channels[i], H / 2^i, W / 2^i]
+            skips.append(h)
+            if i < len(self.downsample):
+                h = self.downsample[i](h)
+
+        h = self.mid1(h, cond)
+        h = self.mid2(h, cond)
+
+        # skips come back deepest first, each at the size h has on reaching it
+        for i, block in enumerate(self.up):
+            h = block(torch.cat([h, skips.pop()], dim=1), cond)
+            if i < len(self.upsample):
+                h = self.upsample[i](h)
+
+        out: Tensor = self.conv_out(F.silu(self.norm_out(h)))  # [B, C, H, W]
+        return out
+
+    # nn.Module types model(x) as Any; checker-only, keep in step with forward
+    if TYPE_CHECKING:
+
+        def __call__(
+            self, x_t: Tensor, t: Tensor, context: Tensor, action: Tensor
+        ) -> Tensor: ...

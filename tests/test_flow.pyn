@@ -1,0 +1,34 @@
+# the straight path from a frame to noise, and its constant velocity
+import torch
+
+from flow import flow_batch, interpolate, velocity
+
+B, C, H, W = 4, 3, 8, 8
+
+
+def test_the_path_starts_at_the_frame_and_ends_at_noise():
+    x0 = torch.randn(B, C, H, W)
+    noise = torch.randn(B, C, H, W)
+    torch.testing.assert_close(interpolate(x0, noise, torch.zeros(B)), x0)
+    torch.testing.assert_close(interpolate(x0, noise, torch.ones(B)), noise)
+
+
+def test_the_velocity_is_the_same_everywhere_on_the_path():
+    # moving from t to t + dt along the velocity lands back on the path
+    x0 = torch.randn(B, C, H, W)
+    noise = torch.randn(B, C, H, W)
+    t = torch.full((B,), 0.3)
+    dt = 0.2
+    stepped = interpolate(x0, noise, t) + dt * velocity(x0, noise)
+    torch.testing.assert_close(stepped, interpolate(x0, noise, t + dt))
+
+
+def test_a_flow_batch_targets_noise_minus_frame():
+    x0 = torch.randn(B, C, H, W)
+    (x_t=, t=, target=) = flow_batch(x0)
+    assert x_t.shape == target.shape == (B, C, H, W)
+    assert t.shape == (B,)
+    assert ((t >= 0) & (t < 1)).all()
+    # recover the noise from the target, then x_t must sit on that path
+    noise = target + x0
+    torch.testing.assert_close(x_t, interpolate(x0, noise, t))

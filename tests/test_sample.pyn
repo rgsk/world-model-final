@@ -1,0 +1,29 @@
+# the Euler sampler, driven by the oracle's exact velocity: it must land on the
+# true next frame, at any number of steps
+import pytest
+import torch
+
+import world
+from oracle import Oracle
+from sample import next_frame
+from world import N_ACTIONS, random_clips, render
+
+N_CLIPS = 8
+N_CONTEXT = 2
+
+
+@pytest.mark.parametrize("steps", [1, 4, 20])
+def test_sampling_the_exact_velocity_draws_the_true_next_frame(steps: int):
+    (frames=, positions=) = random_clips(N_CLIPS, n_frames=N_CONTEXT)
+    action = torch.arange(N_CLIPS) % N_ACTIONS  # every action
+    true_next = render(world.step(positions[:, -1], action))
+    drawn = next_frame(Oracle(), frames, action, steps=)
+    torch.testing.assert_close(drawn, true_next, atol=1e-5, rtol=0)
+
+
+def test_sampling_leaves_the_model_in_its_mode():
+    model = Oracle()
+    model.train()
+    (frames=) = random_clips(2, n_frames=N_CONTEXT)
+    next_frame(model, frames, torch.tensor([0, 1]), steps=2)
+    assert model.training

@@ -1,0 +1,303 @@
+# training the next-frame model on the synthetic world, and checking its
+# control: for every action, draw the next frame and measure where the model
+# put the square, against the exact position world.step gives. A model that draws
+# sharp squares but ignores the action fails this check, as the earlier
+# project's MaskGIT model did. world.step is the world's rule; step alone is a
+# training step
+import math
+import time
+from pathlib import Path
+from typing import TextIO
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+from flow import flow_batch
+from model import UNet, UNetConfig
+from sample import next_frame
+import world
+from world import N_ACTIONS, SPRITE, random_clips, render, sprite_center
+
+# the lr over a run, and the run's length, since training stops when the schedule ends
+type Schedule = (warmup_steps: int, max_steps: int, max_lr: float, min_lr: float)
+type TrainConfig = (
+    batch_size: int,
+    schedule: Schedule,
+    grad_clip: float,
+    eval_interval: int,
+    sample_steps: int,  # Euler steps per drawn frame in the control check
+    n_check: int,  # starting states per action in the control check
+)
+# a training example: the context frames, the action, and the frame it leads to
+type WorldBatch = (context: Tensor, action: Tensor, true_next: Tensor)
+type Control = (
+    accuracy: float,  # share of drawn squares within TOLERANCE of the truth
+    per_action: list[float],  # the same, for each action
+    center_error: float,  # mean distance of the drawn square's centre, pixels
+    pixel_error: float,  # mean |drawn - true| per pixel, colours span 2
+)
+type EvalRow = (
+    step: int, lr: float, train_loss: float, val_loss: float,
+    accuracy: float, pixel_error: float,
+)
+
+# a drawn square counts as in the right place within this many pixels of the
+# true centre on both axes. One action moves it 6, so a wrong move is far off
+TOLERANCE = 1.5
+
+
+def lr_at(step: int, *, schedule: Schedule) -> float:
+    (warmup_steps=, max_steps=, max_lr=, min_lr=) = schedule
+    # linear warmup to max_lr, then cosine decay to min_lr on the last step
+    # train runs (max_steps - 1), as in llm-final
+    last_step = max_steps - 1
+    assert warmup_steps < last_step, (
+        f"warmup_steps {warmup_steps} leaves no decay before step {last_step}"
+    )
+    if step < warmup_steps:
+        # step + 1 so that step 0 is already a warmup step and no step has lr 0
+        return max_lr * (step + 1) / warmup_steps
+    if step >= max_steps:  # past the run
+        return min_lr
+    progress = (step - warmup_steps) / (last_step - warmup_steps)  # 0 -> 1
+    cosine = 0.5 * (1 + math.cos(math.pi * progress))  # 1 -> 0
+    return min_lr + cosine * (max_lr - min_lr)
+
+
+def world_batch(
+    batch_size: int,
+    *,
+    n_context: int,
+    device: torch.device,
+    generator: torch.Generator | None = None,
+) -> WorldBatch:
+    # out: context [B, K, 3, H, W], action [B], true_next [B, 3, H, W], from
+    # clips of K + 1 frames: the last frame is the one to draw
+    (frames=, actions=) = random_clips(
+        batch_size, n_frames=n_context + 1, generator=
+    )
+    return (
+        context=frames[:, :-1].to(device),
+        action=actions[:, -1].to(device),
+        true_next=frames[:, -1].to(device),
+    )
+
+
+def batch_loss(
+    model: UNet, batch: WorldBatch, *, generator: torch.Generator | None = None
+) -> Tensor:
+    # out: [], the flow-matching MSE on the frame each action leads to
+    (context=, action=, true_next=) = batch
+    (x_t=, t=, target=) = flow_batch(true_next, generator=)
+    with torch.autocast(
+        model.device.type, dtype=torch.bfloat16, enabled=model.device.type == "cuda"
+    ):
+        v = model(x_t, t, context, action)  # [B, 3, H, W]
+    return F.mse_loss(v.float(), target)
+
+
+@torch.no_grad()
+def control_check(
+    model: torch.nn.Module, *, n_context: int, n_check: int, sample_steps: int
+) -> Control:
+    # for each action, n_check fixed starting states: draw the next frame and
+    # compare it with the exact one, by where the square's centre is (control)
+    # and pixel by pixel (how clean it looks). The same states and the same
+    # starting noise every call (both seeded), so a change between two checks
+    # comes from the model alone
+    device: torch.device = next(model.parameters()).device
+    generator = torch.Generator().manual_seed(0)
+    noise = torch.Generator(device=device).manual_seed(0)
+    per_action: list[float] = []
+    center_errors: list[Tensor] = []
+    pixel_errors: list[Tensor] = []
+    for a in range(N_ACTIONS):
+        (frames=, positions=) = random_clips(
+            n_check, n_frames=n_context, generator=
+        )
+        action = torch.full((n_check,), a)
+        true_position = world.step(positions[:, -1], action)  # [n, 2]
+        true_center = true_position.float() + (SPRITE - 1) / 2
+        drawn = next_frame(
+            model, frames.to(device), action.to(device),
+            steps=sample_steps, generator=noise,
+        )
+        drawn = drawn.cpu().float()  # [n, 3, H, W]
+        drawn_center = sprite_center(drawn)  # [n, 2]
+        error = (drawn_center - true_center).abs().amax(dim=1)  # [n], worse axis
+        per_action.append((error < TOLERANCE).float().mean().item())
+        center_errors.append(error)
+        true_frame = render(true_position)  # [n, 3, H, W]
+        pixel_errors.append((drawn - true_frame).abs().mean(dim=(1, 2, 3)))
+    accuracy = sum(per_action) / N_ACTIONS
+    return (
+        accuracy=, per_action=,
+        center_error=torch.cat(center_errors).mean().item(),
+        pixel_error=torch.cat(pixel_errors).mean().item(),
+    )
+
+
+def save_checkpoint(
+    path: Path,
+    model: UNet,
+    unet_cfg: UNetConfig,
+    *,
+    step: int,
+    accuracy: float,
+    pixel_error: float,
+) -> None:
+    # weights plus the config that rebuilds the model, as a plain dict so
+    # weights_only loading accepts it; written aside, then renamed
+    ckpt = {
+        "model": model.state_dict(),
+        "unet_cfg": unet_cfg._asdict(),
+        "step": step,
+        "accuracy": accuracy,
+        "pixel_error": pixel_error,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    torch.save(ckpt, tmp)
+    tmp.replace(path)
+
+
+def train(
+    model: UNet,
+    *,
+    train_cfg: TrainConfig,
+    save_best: (path: Path, unet_cfg: UNetConfig) | None = None,
+) -> list[EvalRow]:
+    (
+        batch_size=, schedule=, grad_clip=, eval_interval=,
+        sample_steps=, n_check=,
+    ) = train_cfg
+    (max_steps=) = schedule
+    device = model.device
+    n_context = model.n_context
+    opt = torch.optim.AdamW(model.parameters(), lr=0.0, fused=device.type == "cuda")
+    # one fixed validation batch and fixed noise, so val loss is comparable
+    val_batch = world_batch(
+        256, n_context=, device=, generator=torch.Generator().manual_seed(1)
+    )
+    history: list[EvalRow] = []
+    best = (-1.0, -math.inf)  # (control accuracy, -pixel error) of the best eval
+    loss_sum = torch.tensor(0.0, device=device)  # on the device, no sync per step
+    loss_steps = 0
+    start = time.perf_counter()
+
+    def eval_now(step: int, lr: float):
+        nonlocal best, loss_sum, loss_steps
+        model.eval()
+        val_noise = torch.Generator(device=device).manual_seed(2)
+        with torch.no_grad():
+            val_loss = batch_loss(model, val_batch, generator=val_noise).item()
+        model.train()
+        (accuracy=, per_action=, center_error=, pixel_error=) = (
+            control_check(model, n_context=, n_check=, sample_steps=)
+        )
+        train_loss = (loss_sum / loss_steps).item() if loss_steps else math.nan
+        loss_sum = torch.tensor(0.0, device=device)
+        loss_steps = 0
+        history.append(
+            (
+                step=,
+                lr=,
+                train_loss=,
+                val_loss=,
+                accuracy=,
+                pixel_error=,
+            )
+        )
+        elapsed = time.perf_counter() - start
+        per = " ".join(f"{p:.0%}" for p in per_action)
+        # better control wins; at equal control, the cleaner drawing. Not val
+        # loss: it scores velocities at random noise levels, and its best eval
+        # wasn't the cleanest drawing
+        is_best = (accuracy, -pixel_error) > best
+        print(
+            f"step {step:>5}  lr {lr:.1e}  train {train_loss:.4f}  val {val_loss:.4f}"
+            + f"  control {accuracy:6.1%} ({per})  centre {center_error:.2f}px"
+            + f"  pixels {pixel_error:.4f}"
+            + f"  {elapsed / 60:4.1f}m"
+            + ("  *" if is_best else ""),
+            flush=True,
+        )
+        if is_best:
+            best = (accuracy, -pixel_error)
+            if save_best is not None:
+                (path=, unet_cfg=) = save_best
+                save_checkpoint(
+                    path, model, unet_cfg, step=, accuracy=, pixel_error=
+                )
+
+    model.train()
+    lr = lr_at(0, schedule=)
+    for step in range(max_steps):
+        lr = lr_at(step, schedule=)
+        for group in opt.param_groups:
+            group["lr"] = lr
+        if step % eval_interval == 0:
+            eval_now(step, lr)
+        batch = world_batch(batch_size, n_context=, device=)
+        loss = batch_loss(model, batch)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        opt.step()
+        loss_sum += loss.detach()
+        loss_steps += 1
+    eval_now(max_steps, lr)
+    return history
+
+
+class Tee:
+    # a stream that writes to the terminal and a file at once, so a run's
+    # output lands in its log without shell redirection
+    def __init__(self, terminal: TextIO, file: TextIO):
+        self.terminal = terminal
+        self.file = file
+
+    def write(self, s: str) -> int:
+        self.terminal.write(s)
+        self.file.write(s)
+        return len(s)
+
+    def flush(self) -> None:
+        self.terminal.flush()
+        self.file.flush()
+
+
+if __name__ == "__main__":
+    import sys
+
+    from paths import CKPT_DIR, LOG_DIR
+
+    # names the checkpoint and the log, so runs never overwrite each other
+    RUN_NAME = "world_lr5e-4"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = open(LOG_DIR / f"{RUN_NAME}.log", "w")
+    sys.stdout = Tee(sys.stdout, log)  # sys.stdout is still the terminal here
+    torch.manual_seed(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    unet_cfg: UNetConfig = (
+        frame_channels=3, n_context=2, n_actions=N_ACTIONS,
+        channels=(64, 128, 128), time_dim=256, groups=8,
+    )
+    train_cfg: TrainConfig = (
+        batch_size=64,
+        schedule=(warmup_steps=200, max_steps=4000, max_lr=5e-4, min_lr=5e-5),
+        grad_clip=1.0,
+        eval_interval=250,
+        sample_steps=20,
+        n_check=200,
+    )
+    model = UNet(unet_cfg).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"{n_params / 1e6:.2f}M params")
+    train(
+        model,
+        train_cfg=,
+        save_best=(path=CKPT_DIR / f"{RUN_NAME}.pt", unet_cfg=),
+    )
+    print("\n------ FINISHED ------")

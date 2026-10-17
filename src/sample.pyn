@@ -1,0 +1,36 @@
+# drawing the next frame: walk the flow backwards from noise (t = 1) to a frame
+# (t = 0) by integrating dx/dt = v(x, t) with Euler steps, the model's velocity
+# read with the same context frames and action at every step
+from itertools import pairwise
+
+import torch
+from torch import Tensor, nn
+
+
+@torch.no_grad()
+def next_frame(
+    model: nn.Module,
+    context: Tensor,
+    action: Tensor,
+    *,
+    steps: int,
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    # model: called as model(x_t, t, context, action) -> v, a UNet or a test's
+    # exact velocity
+    # context: [B, K, C, H, W]
+    # action: [B]
+    # out: [B, C, H, W], the frame the action leads to, clamped to [-1, 1]
+    # steps equal intervals from t = 1 down to 0, one model call each, the
+    # velocity read at the interval's start. dt is negative: walking back
+    assert steps >= 1, f"steps must be at least 1, got {steps}"
+    B, K, C, H, W = context.shape
+    was_training = model.training
+    model.eval()
+    x = torch.randn(B, C, H, W, device=context.device, generator=)
+    ts = torch.linspace(1, 0, steps + 1, device=context.device)  # [steps + 1]
+    for t, t_next in pairwise(ts):  # each [], one interval
+        v: Tensor = model(x, t.expand(B), context, action)  # [B, C, H, W]
+        x = x + (t_next - t) * v
+    model.train(was_training)
+    return x.clamp(-1, 1)

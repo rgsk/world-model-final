@@ -1,0 +1,36 @@
+# flow matching's straight path from data to noise, and the velocity along it,
+# as in ../diffusion-final. Here the data is the next frame.
+#   x_t = (1 - t) * x0 + t * noise,   t in [0, 1], t = 0 is data, t = 1 is noise
+# Its derivative in t is noise - x0, the same at every t, so the model's target
+# (the velocity) is one fixed vector per sample. No schedule, nothing learned
+import torch
+from einops import rearrange
+from torch import Tensor
+
+# what one training step regresses: model(x_t, t, ...) should predict target
+type FlowBatch = (x_t: Tensor, t: Tensor, target: Tensor)
+
+
+def interpolate(x0: Tensor, noise: Tensor, t: Tensor) -> Tensor:
+    # x0, noise: [B, C, H, W], t: [B]
+    # out: [B, C, H, W], each frame t[b] of the way from its x0 to its noise
+    t = rearrange(t, "B -> B 1 1 1")  # broadcasts over the pixels
+    return (1 - t) * x0 + t * noise
+
+
+def velocity(x0: Tensor, noise: Tensor) -> Tensor:
+    # x0, noise: [B, C, H, W]
+    # out: [B, C, H, W], d x_t / dt, which takes no t because the path is straight
+    return noise - x0
+
+
+def flow_batch(x0: Tensor, *, generator: torch.Generator | None = None) -> FlowBatch:
+    # x0: [B, C, H, W], clean frames
+    # out: x_t [B, C, H, W], t [B], target [B, C, H, W]
+    # fresh noise and a fresh uniform t per frame, so each step sees new points
+    # on new paths. A seeded generator (on x0's device) draws the same ones
+    # every call, which keeps val loss comparable between evals
+    noise = torch.randn(x0.shape, device=x0.device, generator=)
+    t = torch.rand(len(x0), device=x0.device, generator=)  # [B]
+    x_t = interpolate(x0, noise, t)
+    return (x_t=, t=, target=velocity(x0, noise))

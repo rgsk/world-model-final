@@ -1,0 +1,87 @@
+# the control check scores a perfect model 100% and an action-blind one low,
+# training batches are consistent, and a short run logs every eval
+from pathlib import Path
+from typing import Any
+
+import pytest
+import torch
+
+from model import UNet, UNetConfig
+from oracle import Oracle
+from train_world import Schedule, TrainConfig, control_check, lr_at, train, world_batch
+import world
+from world import N_ACTIONS, NOOP, SPRITE, render, sprite_center
+
+N_CONTEXT = 2
+N_CHECK = 50  # starting states per action
+
+
+def test_a_world_batch_holds_context_action_and_next_frame():
+    (context=, action=, true_next=) = world_batch(
+        8, n_context=N_CONTEXT, device=torch.device("cpu")
+    )
+    B, K, C, H, W = context.shape
+    assert (B, K) == (8, N_CONTEXT)
+    assert action.shape == (B,)
+    assert true_next.shape == (B, C, H, W)
+    # true_next is what the action does to the last context frame
+    last_position = (sprite_center(context[:, -1]) - (SPRITE - 1) / 2).round().long()
+    torch.testing.assert_close(true_next, render(world.step(last_position, action)))
+
+
+def test_a_perfect_model_scores_full_control():
+    (accuracy=, per_action=, center_error=, pixel_error=) = (
+        control_check(Oracle(), n_context=N_CONTEXT, n_check=N_CHECK, sample_steps=4)
+    )
+    assert accuracy == 1.0
+    assert per_action == [1.0] * N_ACTIONS
+    assert center_error < 1e-3
+    assert pixel_error < 1e-5  # the exact frame, pixel for pixel
+
+
+def test_a_model_that_ignores_the_action_fails_the_check():
+    # it always draws noop: right for noop, and for moves blocked by a wall,
+    # wrong for everything else
+    (accuracy=, per_action=) = control_check(
+        Oracle(ignore_action=True), n_context=N_CONTEXT, n_check=N_CHECK, sample_steps=4
+    )
+    assert per_action[NOOP] == 1.0
+    assert accuracy < 0.4
+
+
+@pytest.fixture
+def cfg() -> UNetConfig:
+    return (
+        frame_channels=3, n_context=N_CONTEXT, n_actions=N_ACTIONS,
+        channels=(8, 16), time_dim=16, groups=4,
+    )
+
+
+def test_a_short_run_logs_every_eval_and_saves_the_best(
+    cfg: UNetConfig, tmp_path: Path
+):
+    train_cfg: TrainConfig = (
+        batch_size=4,
+        schedule=(warmup_steps=1, max_steps=4, max_lr=1e-3, min_lr=1e-4),
+        grad_clip=1.0,
+        eval_interval=2,
+        sample_steps=2,
+        n_check=4,
+    )
+    ckpt = tmp_path / "world.pt"
+    history = train(UNet(cfg), train_cfg=, save_best=(path=ckpt, unet_cfg=cfg))
+    # evals at steps 0 and 2, and once more after the last step
+    assert [row.step for row in history] == [0, 2, 4]
+    saved: dict[str, Any] = torch.load(ckpt, weights_only=True)
+    assert saved["unet_cfg"] == cfg._asdict()
+
+
+# steps 0 .. 99 run, with warmup on 0 .. 4 and decay on 5 .. 99
+SCHEDULE: Schedule = (warmup_steps=5, max_steps=100, max_lr=1e-2, min_lr=1e-3)
+
+
+def test_lr_warms_up_to_max_lr_then_decays_to_min_lr():
+    (warmup_steps=, max_steps=, max_lr=, min_lr=) = SCHEDULE
+    assert lr_at(0, schedule=SCHEDULE) == max_lr / warmup_steps
+    assert lr_at(warmup_steps, schedule=SCHEDULE) == pytest.approx(max_lr)
+    assert lr_at(max_steps - 1, schedule=SCHEDULE) == min_lr

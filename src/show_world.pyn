@@ -1,0 +1,78 @@
+# a run's saved model next to the truth: for 4 fixed starting frames, the frame
+# it draws for each action and |drawn - true| per pixel, saved to
+# artifacts/samples/<run>.png. A clean model's error maps are black
+#   uv run byname run src/show_world.pyn world_lr5e-4
+import sys
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from byname import record
+from einops import rearrange
+from torch import Tensor
+
+import world
+from model import UNet, UNetConfig
+from paths import CKPT_DIR, SAMPLES_DIR
+from sample import next_frame
+from world import ACTION_NAMES, N_ACTIONS, random_clips, render
+
+N_STARTS = 4
+SAMPLE_STEPS = 20
+MAX_SHOWN_ERROR = 0.2  # error maps saturate here; colours span 2
+
+
+def load_model(path) -> (model: UNet, step: int, accuracy: float, pixel_error: float):
+    # rebuilds the UNet from the checkpoint's own config, in eval mode on CPU
+    ckpt = torch.load(path, weights_only=True, map_location="cpu")
+    unet_cfg = record(UNetConfig, ckpt["unet_cfg"])
+    model = UNet(unet_cfg).eval()
+    model.load_state_dict(ckpt["model"])
+    return (
+        model=,
+        step=ckpt["step"],
+        accuracy=ckpt["accuracy"],
+        pixel_error=ckpt["pixel_error"],
+    )
+
+
+def as_image(frame: Tensor) -> np.ndarray:
+    # frame: [3, H, W] in [-1, 1]
+    # out: [H, W, 3] in [0, 1], what imshow takes
+    return ((rearrange(frame, "C H W -> H W C") + 1) / 2).clamp(0, 1).numpy()
+
+
+if __name__ == "__main__":
+    run = sys.argv[1]
+    (model=, step=, accuracy=, pixel_error=) = load_model(
+        CKPT_DIR / f"{run}.pt"
+    )
+    print(f"{run}: step {step}, control {accuracy:.1%}, pixels {pixel_error:.4f}")
+    (frames=, positions=) = random_clips(
+        N_STARTS, n_frames=model.n_context, generator=torch.Generator().manual_seed(3)
+    )
+    columns = 1 + 2 * N_ACTIONS
+    fig, axes = plt.subplots(N_STARTS, columns, figsize=(2 * columns, 2 * N_STARTS))
+    for b in range(N_STARTS):
+        axes[b, 0].imshow(as_image(frames[b, -1]))
+        axes[b, 0].set_title("last frame", fontsize=8)
+        for a in range(N_ACTIONS):
+            action = torch.tensor([a])
+            drawn = next_frame(model, frames[b : b + 1], action, steps=SAMPLE_STEPS)[0]
+            true = render(world.step(positions[b : b + 1, -1], action))[0]
+            error_map = (drawn - true).abs().mean(dim=0)  # [H, W]
+            name = ACTION_NAMES[a]
+            axes[b, 1 + 2 * a].imshow(as_image(drawn))
+            axes[b, 1 + 2 * a].set_title(f"{name}: drawn", fontsize=8)
+            axes[b, 2 + 2 * a].imshow(
+                error_map, vmin=0, vmax=MAX_SHOWN_ERROR, cmap="magma"
+            )
+            axes[b, 2 + 2 * a].set_title(f"{name}: |drawn - true|", fontsize=8)
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.suptitle(f"{run}, step {step}", fontsize=10)
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    out = SAMPLES_DIR / f"{run}.png"
+    fig.savefig(out, dpi=70, bbox_inches="tight")
+    print(f"saved {out}")
