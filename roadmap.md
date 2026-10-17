@@ -25,10 +25,12 @@ an average, and can draw content that wasn't on screen. This is how DIAMOND
 ## Done
 1. Setup. llm-final's project layout with byname and pytest, plus paths to
    the earlier project's Zelda frames (72,410 at 128x128).
+2. Synthetic world. A red square on a green 64x64 field, moved 6 px by 5
+   actions (noop, up, down, left, right) and stopped by the walls. Clips are
+   generated on the fly, and sprite_center measures where a frame draws the
+   square, which is how a model's control will be checked.
 
 ## Next
-2. Synthetic world. A sprite on a background that actions move by a fixed
-   step, generated on the fly, with the exact next frame known for checking.
 3. Flow-matching next-frame model on the synthetic world: a UNet like
    diffusion-final's, conditioned on the previous frames and the action.
    Control accuracy measured against the exact answer; target 100%.

@@ -1,0 +1,110 @@
+# the synthetic world: a red square on a green field, moved by 5 actions.
+# Every frame is computed from the square's position, so the exact next frame
+# for any action is known, and a model's frame can be checked by measuring
+# where it drew the square. Clips are generated on the fly, so there's no
+# dataset and nothing to overfit
+import torch
+from einops import rearrange
+from torch import Tensor
+
+SIZE = 64  # frame height and width, pixels
+SPRITE = 10  # square side, pixels
+STEP = 6  # pixels moved per action
+# position = the square's top-left pixel; it stays inside the frame
+MAX_POS = SIZE - SPRITE
+
+NOOP, UP, DOWN, LEFT, RIGHT = range(5)
+N_ACTIONS = 5
+ACTION_NAMES = ["noop", "up", "down", "left", "right"]
+# (dx, dy) per action, in image coordinates: x right, y down
+ACTION_DELTAS = torch.tensor([[0, 0], [0, -STEP], [0, STEP], [-STEP, 0], [STEP, 0]])
+
+# colours in [-1, 1], the range the models work in
+BACKGROUND = torch.tensor([-0.75, 0.1, -0.75])  # green
+FOREGROUND = torch.tensor([0.7, -0.8, -0.8])  # red
+
+type Clip = (
+    frames: Tensor,  # [B, T, 3, H, W]
+    actions: Tensor,  # [B, T - 1], actions[:, t] turns frame t into frame t + 1
+    positions: Tensor,  # [B, T, 2], (x, y) top-left of the square in each frame
+)
+
+
+def step(positions: Tensor, actions: Tensor) -> Tensor:
+    # positions: [B, 2]
+    # actions: [B]
+    # out: [B, 2], moved by each action and stopped at the walls, so pushing
+    # into an edge leaves the square where it is
+    moved = positions + ACTION_DELTAS[actions]
+    return moved.clamp(0, MAX_POS)
+
+
+def render(positions: Tensor) -> Tensor:
+    # positions: [B, 2]
+    # out: [B, 3, H, W] in [-1, 1]
+    B = len(positions)
+    pixels = torch.arange(SIZE)  # [W], also [H]
+    x = rearrange(positions[:, 0], "B -> B 1")
+    y = rearrange(positions[:, 1], "B -> B 1")
+    in_columns = (pixels >= x) & (pixels < x + SPRITE)  # [B, W]
+    in_rows = (pixels >= y) & (pixels < y + SPRITE)  # [B, H]
+    rows = rearrange(in_rows, "B H -> B 1 H 1")
+    columns = rearrange(in_columns, "B W -> B 1 1 W")
+    inside = rows & columns  # [B, 1, H, W]
+    background = rearrange(BACKGROUND, "C -> 1 C 1 1").expand(B, 3, SIZE, SIZE)
+    foreground = rearrange(FOREGROUND, "C -> 1 C 1 1")
+    return torch.where(inside, foreground, background)
+
+
+def random_clips(
+    batch_size: int, *, n_frames: int, generator: torch.Generator | None = None
+) -> Clip:
+    # out: batch_size clips of n_frames frames, from random start positions and
+    # random actions, all 5 equally likely
+    start = torch.randint(0, MAX_POS + 1, (batch_size, 2), generator=)
+    actions = torch.randint(0, N_ACTIONS, (batch_size, n_frames - 1), generator=)
+    trajectory = [start]
+    for t in range(n_frames - 1):
+        trajectory.append(step(trajectory[-1], actions[:, t]))
+    positions = torch.stack(trajectory, dim=1)  # [B, T, 2]
+    flat = rearrange(positions, "B T xy -> (B T) xy")
+    frames = rearrange(render(flat), "(B T) C H W -> B T C H W", B=batch_size)
+    return (frames=, actions=, positions=)
+
+
+def sprite_center(frames: Tensor) -> Tensor:
+    # frames: [B, 3, H, W], from the world or drawn by a model
+    # out: [B, 2], (x, y) centroid of the red pixels, weighted by how red each
+    # is, so a model's slightly blurred square is still found. The square's true
+    # centre is position + (SPRITE - 1) / 2
+    redness = (frames[:, 0] - frames[:, 1]).clamp(min=0)  # [B, H, W], 0 on green
+    B, H, W = redness.shape
+    ys = rearrange(torch.arange(H, dtype=frames.dtype), "H -> 1 H 1")
+    xs = rearrange(torch.arange(W, dtype=frames.dtype), "W -> 1 1 W")
+    total = redness.sum(dim=(1, 2)).clamp(min=1e-6)  # [B]
+    x = (redness * xs).sum(dim=(1, 2)) / total
+    y = (redness * ys).sum(dim=(1, 2)) / total
+    return torch.stack([x, y], dim=1)
+
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    from paths import SAMPLES_DIR
+
+    torch.manual_seed(0)
+    (frames=, actions=) = random_clips(4, n_frames=8)
+    fig, axes = plt.subplots(4, 8, figsize=(16, 8.5))
+    for b in range(4):
+        for t in range(8):
+            ax = axes[b, t]
+            ax.imshow((rearrange(frames[b, t], "C H W -> H W C") + 1) / 2)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if t > 0:  # the action that made this frame
+                ax.set_title(ACTION_NAMES[actions[b, t - 1]], fontsize=10)
+    fig.suptitle("4 random clips; each title is the action that led to that frame")
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    out = SAMPLES_DIR / "world_clips.png"
+    fig.savefig(out, dpi=80, bbox_inches="tight")
+    print(f"saved {out}")

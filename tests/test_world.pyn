@@ -1,0 +1,80 @@
+# the synthetic world: actions move the square by a fixed step, walls stop it,
+# frames show exactly one square, and sprite_center finds it
+import torch
+from einops import rearrange
+
+from world import (
+    ACTION_DELTAS, BACKGROUND, DOWN, FOREGROUND, LEFT, MAX_POS, N_ACTIONS, NOOP,
+    RIGHT, SIZE, SPRITE, STEP, UP, random_clips, render, sprite_center, step,
+)
+
+MIDDLE = torch.tensor([[27, 27]])  # far from every wall
+
+
+def moved(position: torch.Tensor, action: int) -> torch.Tensor:
+    return step(position, torch.tensor([action]))
+
+
+def test_each_action_moves_by_one_step():
+    assert moved(MIDDLE, NOOP).tolist() == [[27, 27]]
+    assert moved(MIDDLE, UP).tolist() == [[27, 27 - STEP]]
+    assert moved(MIDDLE, DOWN).tolist() == [[27, 27 + STEP]]
+    assert moved(MIDDLE, LEFT).tolist() == [[27 - STEP, 27]]
+    assert moved(MIDDLE, RIGHT).tolist() == [[27 + STEP, 27]]
+
+
+def test_walls_stop_the_square():
+    top_left = torch.tensor([[0, 0]])
+    assert moved(top_left, UP).tolist() == [[0, 0]]
+    assert moved(top_left, LEFT).tolist() == [[0, 0]]
+    # one pixel from the right wall: a step of 6 stops at the wall
+    near_right = torch.tensor([[MAX_POS - 1, 27]])
+    assert moved(near_right, RIGHT).tolist() == [[MAX_POS, 27]]
+
+
+def test_a_frame_shows_exactly_one_square():
+    frame = render(MIDDLE)[0]  # [3, H, W]
+    red = rearrange(FOREGROUND, "C -> C 1 1")
+    green = rearrange(BACKGROUND, "C -> C 1 1")
+    is_red = (frame == red).all(dim=0)  # [H, W]
+    is_green = (frame == green).all(dim=0)
+    assert is_red.sum() == SPRITE * SPRITE
+    assert (is_red | is_green).all()  # no other colours
+    last = 27 + SPRITE - 1  # the square's last row and column
+    assert is_red[27, 27] and is_red[last, last]
+    assert not is_red[last + 1, 27]  # just past the square
+
+
+def test_sprite_center_finds_the_squares_centre():
+    positions = torch.tensor([[0, 0], [27, 40], [MAX_POS, MAX_POS]])
+    centers = sprite_center(render(positions))
+    expected = positions.float() + (SPRITE - 1) / 2
+    torch.testing.assert_close(centers, expected)
+
+
+def test_clips_follow_their_actions():
+    (frames=, actions=, positions=) = random_clips(32, n_frames=6)
+    B, T, C, H, W = frames.shape
+    assert (B, T, C, H, W) == (32, 6, 3, SIZE, SIZE)
+    assert actions.shape == (32, 5)
+    for t in range(T - 1):
+        expected = step(positions[:, t], actions[:, t])
+        assert torch.equal(positions[:, t + 1], expected)
+        # what a model will be checked on: the drawn square moved as commanded
+        drawn_move = sprite_center(frames[:, t + 1]) - sprite_center(frames[:, t])
+        true_move = (expected - positions[:, t]).float()
+        torch.testing.assert_close(drawn_move, true_move)
+
+
+def test_clips_use_every_action():
+    (actions=) = random_clips(64, n_frames=10)
+    counts = torch.bincount(actions.flatten(), minlength=N_ACTIONS)
+    assert (counts > 0).all()
+    assert len(ACTION_DELTAS) == N_ACTIONS
+
+
+def test_a_generator_makes_clips_repeatable():
+    first = random_clips(4, n_frames=5, generator=torch.Generator().manual_seed(1))
+    second = random_clips(4, n_frames=5, generator=torch.Generator().manual_seed(1))
+    assert torch.equal(first.frames, second.frames)
+    assert torch.equal(first.actions, second.actions)
