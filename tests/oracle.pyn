@@ -2,13 +2,14 @@
 # position from the last context frame, applies the world's rule, and returns
 # the exact velocity toward the true next frame x0. On the straight path
 # x_t = (1 - t) x0 + t noise, that velocity is (x_t - x0) / t for any t > 0, so
-# Euler sampling with it lands exactly on x0 at any number of steps
+# Euler sampling with it lands exactly on x0 at any number of steps. Also a
+# perfect action guesser, which reads the true move off two frames
 import torch
 from einops import rearrange
 from torch import Tensor, nn
 
 import world
-from world import NOOP, SPRITE, render, sprite_center
+from world import NOOP, SPRITE, effect, render, sprite_center
 
 
 class Oracle(nn.Module):
@@ -33,3 +34,23 @@ class Oracle(nn.Module):
             action = torch.full_like(action, NOOP)
         x0 = render(world.step(position.cpu(), action.cpu())).to(x_t)
         return (x_t - x0) / rearrange(t, "B -> B 1 1 1")
+
+
+def positions(frames: Tensor) -> Tensor:
+    # frames: [B, 3, H, W], from the world
+    # out: [B, 2] long, the square's top-left
+    return (sprite_center(frames) - (SPRITE - 1) / 2).round().long()
+
+
+class PerfectGuesser:
+    # reads the true move off two frames and names it by move_codes, an
+    # invented naming like a trained guesser's
+    def __init__(self, move_codes: Tensor):
+        # move_codes: [N_ACTIONS], the code it gives each move
+        self.move_codes = move_codes
+
+    def codes(self, before: Tensor, after: Tensor) -> Tensor:
+        # before, after: [B, 3, H, W]
+        # out: [B] long, the code of the move shown
+        moves = effect(positions(before.cpu()), positions(after.cpu()))  # [B]
+        return self.move_codes[moves]

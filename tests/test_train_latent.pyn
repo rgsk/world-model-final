@@ -1,0 +1,60 @@
+# stage 1 training: a perfect guesser's codes score full accuracy under any
+# naming and each key finds its code, and a short run logs every eval and saves
+# the best
+from pathlib import Path
+from typing import Any
+
+import pytest
+import torch
+
+from latent_action import LatentActionModel, LatentConfig
+from oracle import PerfectGuesser
+from train_latent import LatentTrainConfig, code_check, key_codes, train
+from world import N_ACTIONS
+
+N_CODES = 7  # more codes than moves, so some go unused
+# the code a guesser might invent for each move: noop, up, down, left, right
+INVENTED = torch.tensor([4, 0, 6, 2, 1])
+
+
+def test_a_perfect_guesser_scores_full_accuracy_under_any_naming():
+    (accuracy=, n_used=, table=) = code_check(
+        PerfectGuesser(INVENTED).codes,
+        device=torch.device("cpu"),
+        n_codes=N_CODES,
+        n_check=200,
+    )
+    assert accuracy == 1.0
+    assert n_used == N_ACTIONS
+    assert torch.equal(key_codes(table), INVENTED)  # each key finds its code
+
+
+@pytest.fixture
+def latent_cfg() -> LatentConfig:
+    return (
+        frame_channels=3, n_codes=N_CODES, guesser_channels=(8, 16),
+        predictor_channels=(8, 16), code_dim=8, groups=4,
+    )
+
+
+def test_a_short_run_logs_every_eval_and_saves_the_best(
+    latent_cfg: LatentConfig, tmp_path: Path
+):
+    train_cfg: LatentTrainConfig = (
+        batch_size=4,
+        schedule=(warmup_steps=1, max_steps=4, max_lr=1e-3, min_lr=1e-4),
+        grad_clip=1.0,
+        eval_interval=2,
+        n_check=20,
+        unquantized_steps=2,
+    )
+    ckpt = tmp_path / "latent.pt"
+    history = train(
+        LatentActionModel(latent_cfg), latent_cfg=, train_cfg=, save_best=ckpt
+    )
+    # evals at steps 0 and 2, and once more after the last step. Step 0 is
+    # unquantized; the codebook is placed before step 2's eval
+    assert [row.step for row in history] == [0, 2, 4]
+    saved: dict[str, Any] = torch.load(ckpt, weights_only=True)
+    assert saved["latent_cfg"] == latent_cfg._asdict()
+    assert saved["key_codes"].shape == (N_ACTIONS,)

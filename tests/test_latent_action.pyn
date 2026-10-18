@@ -1,0 +1,147 @@
+# the latent action model's pieces: the guesser's summary snapped to its
+# nearest codebook point with z's gradient passed through, a predictor that
+# starts by copying the frame and reads the code's point once trained, the
+# unquantized mode, k-means finding clumps and the codebook placed on them, the
+# true move a transition shows, and the score of a guesser's codes
+import pytest
+import torch
+from torch import nn
+
+import world
+from latent_action import (
+    ActionGuesser, FramePredictor, LatentActionModel, LatentConfig, code_accuracy,
+    code_table, kmeans, link_codes, place_codes, quantize,
+)
+from world import DOWN, LEFT, MAX_POS, N_ACTIONS, NOOP, RIGHT, UP, effect, render
+
+N_CODES = 8
+CODE_DIM = 8
+BATCH = 4
+MIDDLE = torch.tensor([[27, 27]])  # far from every wall
+
+
+@pytest.fixture
+def cfg() -> LatentConfig:
+    return (
+        frame_channels=3, n_codes=N_CODES, guesser_channels=(8, 16),
+        predictor_channels=(8, 16), code_dim=CODE_DIM, groups=4,
+    )
+
+
+def a_move_right() -> tuple[torch.Tensor, torch.Tensor]:
+    # out: (before, after), BATCH frames of the square moving right
+    before = render(MIDDLE.expand(BATCH, 2))
+    after = render(world.step(MIDDLE.expand(BATCH, 2), torch.full((BATCH,), RIGHT)))
+    return before, after
+
+
+def test_the_guesser_sums_up_the_change_as_one_point(cfg: LatentConfig):
+    before, after = a_move_right()
+    assert ActionGuesser(cfg)(before, after).shape == (BATCH, CODE_DIM)
+
+
+def test_quantize_snaps_to_the_nearest_point_and_passes_the_gradient():
+    codebook = torch.tensor([[0.0, 0.0], [10.0, 0.0], [0.0, 10.0]])
+    z = torch.tensor([[9.0, 1.0], [1.0, 1.0]], requires_grad=True)
+    (point=, codes=) = quantize(z, codebook)
+    assert codes.tolist() == [1, 0]
+    torch.testing.assert_close(point, codebook[[1, 0]])
+    # straight-through, so z's gradient is the point's, unchanged
+    weights = torch.randn(2, 2)
+    (point * weights).sum().backward()
+    torch.testing.assert_close(z.grad, weights)
+
+
+def test_a_fresh_model_predicts_the_frame_before(cfg: LatentConfig):
+    # the predictor's output conv starts at 0, so it adds no change
+    before, after = a_move_right()
+    assert torch.equal(LatentActionModel(cfg)(before, after).predicted, before)
+
+
+def test_the_code_changes_the_prediction_once_trained(cfg: LatentConfig):
+    # the zero-init convs are given random weights, as training would. Until
+    # then the code has no path to the output
+    predictor = FramePredictor(cfg)
+    for module in predictor.modules():
+        if isinstance(module, nn.Conv2d) and (module.weight == 0).all():
+            nn.init.normal_(module.weight, std=0.1)
+    before, _ = a_move_right()
+    points = torch.randn(BATCH, CODE_DIM)  # a different point per frame
+    same = points[:1].expand(BATCH, CODE_DIM)  # one point for all
+    predicted = predictor(before, points)
+    assert not torch.allclose(predicted[0], predicted[1])  # same frame, other code
+    assert torch.allclose(predictor(before, same)[0], predictor(before, same)[1])
+
+
+def test_unquantized_the_predictor_reads_z_itself(cfg: LatentConfig):
+    model = LatentActionModel(cfg)
+    before, after = a_move_right()
+    (predicted=, vq_loss=) = model(before, after, quantized=False)
+    z = model.guesser(before, after)
+    torch.testing.assert_close(predicted, model.predictor(before, z))
+    assert vq_loss == 0  # no codebook to pull yet
+
+
+def test_kmeans_finds_separated_clumps():
+    # three tight clumps of 20 points each, far apart
+    middles = torch.tensor([[0.0, 0.0], [10.0, 0.0], [0.0, 10.0]])
+    spread = 0.1 * torch.randn(3, 20, 2)
+    points = (middles[:, None] + spread).reshape(60, 2)
+    centres = kmeans(points, 3, generator=torch.Generator().manual_seed(0))
+    # one centre per clump, at its mean, whatever the order
+    for middle, clump in zip(middles, (middles[:, None] + spread)):
+        nearest = centres[torch.cdist(middle[None], centres).argmin()]
+        torch.testing.assert_close(nearest, clump.mean(dim=0))
+
+
+def test_placed_codes_give_different_moves_different_codes(cfg: LatentConfig):
+    # half the transitions stay still and half move right; a fresh guesser
+    # already sums the two kinds up as two different points
+    model = LatentActionModel(cfg._replace(n_codes=2))
+    still = render(MIDDLE.expand(BATCH, 2))
+    moved = render(world.step(MIDDLE.expand(BATCH, 2), torch.full((BATCH,), RIGHT)))
+    before = torch.cat([still, still])
+    after = torch.cat([still, moved])
+    place_codes(model, before, after, generator=torch.Generator().manual_seed(0))
+    codes = model.codes(before, after)
+    assert len(set(codes[:BATCH].tolist())) == 1  # still, one code
+    assert len(set(codes[BATCH:].tolist())) == 1  # moved, one code
+    assert codes[0] != codes[-1]
+
+
+def moves_from(position: torch.Tensor, action: int) -> torch.Tensor:
+    after = world.step(position, torch.tensor([action]))
+    return effect(position, after)
+
+
+def test_effect_names_the_move_a_transition_shows():
+    for action in (NOOP, UP, DOWN, LEFT, RIGHT):
+        assert moves_from(MIDDLE, action).tolist() == [action]
+
+
+def test_a_press_into_a_wall_shows_no_move():
+    corner = torch.tensor([[0, 0]])
+    assert moves_from(corner, LEFT).tolist() == [NOOP]
+    assert moves_from(corner, UP).tolist() == [NOOP]
+    # one pixel from the right wall, cut short to one pixel, but still a move
+    near_right = torch.tensor([[MAX_POS - 1, 27]])
+    assert moves_from(near_right, RIGHT).tolist() == [RIGHT]
+
+
+def test_codes_that_each_stand_for_one_move_score_full_accuracy():
+    moves = torch.arange(N_ACTIONS).repeat(10)  # every move, 10 times
+    codes = (moves + 2) % N_CODES  # a relabelling, as a guesser invents
+    table = code_table(codes, moves, n_codes=N_CODES, n_moves=N_ACTIONS)
+    assert table.sum() == len(moves)
+    assert code_accuracy(table) == 1.0
+    # each used code links back to its move
+    used = (moves[:N_ACTIONS] + 2) % N_CODES
+    assert torch.equal(link_codes(table)[used], torch.arange(N_ACTIONS))
+
+
+def test_one_code_for_everything_scores_the_commonest_move():
+    moves = torch.tensor([NOOP, NOOP, NOOP, LEFT])
+    codes = torch.zeros_like(moves)  # the guesser collapsed
+    table = code_table(codes, moves, n_codes=N_CODES, n_moves=N_ACTIONS)
+    assert code_accuracy(table) == 3 / 4
+    assert link_codes(table)[0] == NOOP

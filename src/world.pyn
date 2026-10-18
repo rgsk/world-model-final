@@ -39,6 +39,15 @@ def step(positions: Tensor, actions: Tensor) -> Tensor:
     return moved.clamp(0, MAX_POS)
 
 
+def effect(before: Tensor, after: Tensor) -> Tensor:
+    # before, after: [B, 2], positions one world.step apart
+    # out: [B], the action the move looks like, by its direction. A press into
+    # a wall looks like noop, and a move cut short by a wall still counts
+    direction = (after - before).sign()  # [B, 2]
+    matches = rearrange(direction, "B xy -> B 1 xy") == ACTION_DELTAS.sign()
+    return matches.all(dim=2).int().argmax(dim=1)  # [B], exactly one matches
+
+
 def render(positions: Tensor) -> Tensor:
     # positions: [B, 2]
     # out: [B, 3, H, W] in [-1, 1]

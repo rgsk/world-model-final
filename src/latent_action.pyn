@@ -1,0 +1,257 @@
+# the latent action model: guessing the action from the frames alone, as
+# Genie does. Two parts train together and no true action is ever shown.
+# - the guesser looks at the frame before and the frame after and sums up the
+#   change as a point z; the nearest of n_codes codebook points is the code
+# - the predictor sees only the frame before and the code's point, and draws
+#   the frame after in one step, scored by pixel error
+# The frame before can't say which way things move, so the predictor needs the
+# code for that, which pushes the guesser to make each code mean one move. Few
+# codes keep the code from carrying the whole frame after. Afterwards the
+# predictor is dropped and the guesser labels the frames a world model trains on.
+# Training starts unquantized, the predictor reading z itself, because a hard
+# choice at the start gives the guesser too little feedback and every move
+# lands on one code. Once moves sit in separate clumps, k-means places the
+# codebook on them. In the synthetic world the true move is known, so the codes
+# can be scored
+from typing import TYPE_CHECKING, Final
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+from torch import Tensor, nn
+
+from model import Downsample, ResBlock, Upsample, zero_init
+
+type LatentConfig = (
+    frame_channels: int,
+    n_codes: int,
+    guesser_channels: tuple[int, ...],  # conv widths, each level halving H and W
+    predictor_channels: tuple[int, ...],  # UNet widths per level
+    code_dim: int,  # width of z and of each codebook point
+    groups: int,  # GroupNorm groups
+)
+# a batch of z snapped to the codebook
+type Quantized = (
+    point: Tensor,  # [B, code_dim], the nearest codebook point, passing z's gradient
+    codes: Tensor,  # [B] long, which point
+    vq_loss: Tensor,  # [], pulls points toward their z, and z toward its point
+)
+
+# how hard z is pulled toward its point, against the point toward z (VQ-VAE's beta)
+COMMITMENT = 0.25
+
+
+class ActionGuesser(nn.Module):
+    def __init__(self, cfg: LatentConfig):
+        super().__init__()
+        (
+            frame_channels=, guesser_channels=, code_dim=, groups=
+        ): Final = cfg
+        layers: list[nn.Module] = []
+        ch = 2 * frame_channels  # the two frames, stacked
+        for out_ch in guesser_channels:
+            layers += [
+                nn.Conv2d(ch, out_ch, 3, stride=2, padding=1),
+                nn.GroupNorm(groups, out_ch),
+                nn.SiLU(),
+            ]
+            ch = out_ch
+        self.convs = nn.Sequential(*layers)
+        self.head = nn.Linear(ch, code_dim)
+
+    def forward(self, before: Tensor, after: Tensor) -> Tensor:
+        # before, after: [B, C, H, W], a frame and the one that follows it
+        # out: [B, code_dim], z, a summary of the change
+        both = torch.cat([before, after], dim=1)  # [B, 2C, H, W]
+        h: Tensor = self.convs(both)  # [B, channels[-1], H / 2^L, W / 2^L]
+        pooled = h.mean(dim=(2, 3))  # [B, channels[-1]]
+        return self.head(pooled)
+
+    # nn.Module types model(x) as Any; checker-only, keep in step with forward
+    if TYPE_CHECKING:
+
+        def __call__(self, before: Tensor, after: Tensor) -> Tensor: ...
+
+
+def quantize(z: Tensor, codebook: Tensor) -> Quantized:
+    # z: [B, code_dim]
+    # codebook: [n_codes, code_dim]
+    # out: each z's nearest point. Going forward the point is exact; going
+    # backward z gets the point's gradient unchanged, because the gap between
+    # them is added detached (straight-through). The loss moves each point
+    # toward the z that chose it and z toward its point, more gently
+    distances = torch.cdist(z, codebook)  # [B, n_codes]
+    codes = distances.argmin(dim=1)  # [B]
+    nearest = codebook[codes]  # [B, code_dim]
+    vq_loss = F.mse_loss(nearest, z.detach()) + COMMITMENT * F.mse_loss(
+        z, nearest.detach()
+    )
+    point = z + (nearest - z).detach()
+    return (point=, codes=, vq_loss=)
+
+
+class FramePredictor(nn.Module):
+    # a small UNet from the frame before and a code's point to the frame
+    # after. It predicts the change and adds it to the frame before, and its
+    # output conv starts at 0, so a fresh predictor copies the frame before
+    def __init__(self, cfg: LatentConfig):
+        super().__init__()
+        (
+            frame_channels=, predictor_channels=, code_dim=, groups=
+        ): Final = cfg
+        self.conv_in = nn.Conv2d(frame_channels, predictor_channels[0], 3, padding=1)
+        # down: level i takes the previous width to predictor_channels[i]
+        self.down = nn.ModuleList()
+        ch = predictor_channels[0]
+        for out_ch in predictor_channels:
+            self.down.append(ResBlock(ch, out_ch, time_dim=code_dim, groups=))
+            ch = out_ch
+        # between levels only, so the deepest level is not halved again
+        self.downsample = nn.ModuleList(
+            [Downsample(c) for c in predictor_channels[:-1]]
+        )
+        self.mid = ResBlock(ch, ch, time_dim=code_dim, groups=)
+        # up: deepest level first; each block also reads that level's skip
+        self.up = nn.ModuleList()
+        for out_ch in reversed(predictor_channels):
+            self.up.append(ResBlock(ch + out_ch, out_ch, time_dim=code_dim, groups=))
+            ch = out_ch
+        self.upsample = nn.ModuleList(
+            [Upsample(c) for c in reversed(predictor_channels[1:])]
+        )
+        self.norm_out = nn.GroupNorm(groups, ch)
+        self.conv_out = nn.Conv2d(ch, frame_channels, 3, padding=1)
+        zero_init(self.conv_out)
+
+    def forward(self, before: Tensor, point: Tensor) -> Tensor:
+        # before: [B, C, H, W]
+        # point: [B, code_dim], the code's codebook point
+        # out: [B, C, H, W], the predicted frame after
+        h: Tensor = self.conv_in(before)  # [B, channels[0], H, W]
+        skips: list[Tensor] = []
+        for i, block in enumerate(self.down):
+            h = block(h, point)  # [B, channels[i], H / 2^i, W / 2^i]
+            skips.append(h)
+            if i < len(self.downsample):
+                h = self.downsample[i](h)
+        h = self.mid(h, point)
+        for i, block in enumerate(self.up):
+            h = block(torch.cat([h, skips.pop()], dim=1), point)
+            if i < len(self.upsample):
+                h = self.upsample[i](h)
+        change: Tensor = self.conv_out(F.silu(self.norm_out(h)))  # [B, C, H, W]
+        return before + change
+
+    # nn.Module types model(x) as Any; checker-only, keep in step with forward
+    if TYPE_CHECKING:
+
+        def __call__(self, before: Tensor, point: Tensor) -> Tensor: ...
+
+
+# what the model makes of one batch of transitions
+type LatentOutput = (
+    predicted: Tensor,  # [B, C, H, W], the frame after as the predictor draws it
+    codes: Tensor,  # [B] long, the code the guesser chose
+    vq_loss: Tensor,  # [], the codebook's share of the loss
+)
+
+
+class LatentActionModel(nn.Module):
+    def __init__(self, cfg: LatentConfig):
+        super().__init__()
+        (n_codes=, code_dim=): Final = cfg
+        self.guesser = ActionGuesser(cfg)
+        # its starting points don't matter, because place_codes sets them once
+        # the unquantized steps have spread z into clumps
+        self.codebook = nn.Embedding(n_codes, code_dim)
+        self.predictor = FramePredictor(cfg)
+
+    def forward(
+        self, before: Tensor, after: Tensor, *, quantized: bool = True
+    ) -> LatentOutput:
+        # before, after: [B, C, H, W]
+        # quantized: False hands the predictor z itself, with no codebook loss,
+        # as in the first steps of training
+        z = self.guesser(before, after)  # [B, code_dim]
+        (point=, codes=, vq_loss=) = quantize(z, self.codebook.weight)
+        if not quantized:
+            return (
+                predicted=self.predictor(before, z), codes=, vq_loss=z.new_zeros(())
+            )
+        return (predicted=self.predictor(before, point), codes=, vq_loss=)
+
+    @torch.no_grad()
+    def codes(self, before: Tensor, after: Tensor) -> Tensor:
+        # before, after: [B, C, H, W]
+        # out: [B] long, the code of each transition
+        return quantize(self.guesser(before, after), self.codebook.weight).codes
+
+    # nn.Module types model(x) as Any; checker-only, keep in step with forward
+    if TYPE_CHECKING:
+
+        def __call__(
+            self, before: Tensor, after: Tensor, *, quantized: bool = True
+        ) -> LatentOutput: ...
+
+
+def kmeans(
+    points: Tensor, k: int, *, generator: torch.Generator, iterations: int = 50
+) -> Tensor:
+    # points: [N, D]
+    # out: [k, D], the centres of k clumps. k-means++ starts them apart, each
+    # new centre at a point drawn by its squared distance from the centres so
+    # far, so two centres rarely start in one clump. Then each centre moves to
+    # the mean of the points nearest it, iterations times
+    first = torch.randint(len(points), (1,), generator=generator)
+    centres = points[first]  # [1, D]
+    for _ in range(k - 1):
+        gap = (
+            torch.cdist(points, centres).amin(dim=1) ** 2
+        )  # [N], to the nearest centre
+        drawn = torch.multinomial(gap / gap.sum(), 1, generator=generator)
+        centres = torch.cat([centres, points[drawn]])
+    for _ in range(iterations):
+        nearest = torch.cdist(points, centres).argmin(dim=1)  # [N]
+        for c in range(k):
+            members = points[nearest == c]
+            if len(members):  # a centre with no points stays put
+                centres[c] = members.mean(dim=0)
+    return centres
+
+
+@torch.no_grad()
+def place_codes(
+    model: LatentActionModel,
+    before: Tensor,
+    after: Tensor,
+    *,
+    generator: torch.Generator,
+) -> None:
+    # before, after: [B, C, H, W], transitions whose z the codebook is fitted to
+    # the codebook's points move to the centres of the clumps the z form
+    z = model.guesser(before, after).cpu()  # [B, code_dim]
+    n_codes = model.codebook.num_embeddings
+    centres = kmeans(z, n_codes, generator=)  # [n_codes, code_dim]
+    model.codebook.weight.copy_(centres)
+
+
+def code_table(codes: Tensor, moves: Tensor, *, n_codes: int, n_moves: int) -> Tensor:
+    # codes, moves: [B], the code guessed for each transition and its true move
+    # out: [n_codes, n_moves] long, how often each code went with each move
+    pairs = codes * n_moves + moves  # [B], one index per (code, move)
+    counts = torch.bincount(pairs, minlength=n_codes * n_moves)
+    return rearrange(counts, "(code move) -> code move", move=n_moves)
+
+
+def link_codes(table: Tensor) -> Tensor:
+    # table: [n_codes, n_moves]
+    # out: [n_codes], the move each code goes with most often
+    return table.argmax(dim=1)
+
+
+def code_accuracy(table: Tensor) -> float:
+    # table: [n_codes, n_moves]
+    # out: the share of transitions whose code is linked to their true move.
+    # 1 means every code stands for one move; a code used for two moves loses
+    # the smaller one
+    return (table.amax(dim=1).sum() / table.sum().clamp(min=1)).item()

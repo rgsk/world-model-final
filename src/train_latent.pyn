@@ -1,0 +1,240 @@
+# stage 1 of learning actions from frames alone: training the latent action
+# model (guesser + predictor) on pairs of consecutive frames, by the
+# predictor's pixel error plus the codebook's loss. The first unquantized_steps
+# hand the predictor z itself, so moves spread into clumps; then k-means places
+# the codebook on the clumps and the codes take over. The true key is never
+# shown to the model. It is only used to score the codes, by code_check, which
+# asks whether each code stands for one true move. Stage 2 trains the world
+# model on the frozen guesser's codes
+import math
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Final
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+from latent_action import (
+    LatentActionModel, LatentConfig, code_accuracy, code_table, place_codes,
+)
+from train_world import Schedule, Tee, lr_at
+from world import N_ACTIONS, effect, random_clips
+
+type LatentTrainConfig = (
+    batch_size: int,
+    schedule: Schedule,
+    grad_clip: float,
+    eval_interval: int,
+    n_check: int,  # transitions per code check
+    unquantized_steps: int,  # first steps, the predictor reading z itself
+)
+type CodeCheck = (
+    accuracy: float,  # share of transitions whose code is linked to their true move
+    n_used: int,  # codes guessed at least once
+    table: Tensor,  # [n_codes, N_ACTIONS], how often each code went with each move
+)
+N_PLACE = 2000  # transitions k-means fits the codebook to
+
+type LatentEvalRow = (
+    step: int, lr: float, train_loss: float, val_loss: float,
+    code_accuracy: float, n_used: int,
+)
+
+
+def pair_loss(model: LatentActionModel, frames: Tensor, *, quantized: bool) -> Tensor:
+    # frames: [B, 2, C, H, W], a frame and the one after it
+    # out: [], the predictor's pixel MSE on the frame after, plus the
+    # codebook's loss once quantized
+    before, after = frames[:, 0], frames[:, 1]
+    (predicted=, vq_loss=) = model(before, after, quantized=)
+    return F.mse_loss(predicted, after) + vq_loss
+
+
+@torch.no_grad()
+def code_check(
+    codes_of: Callable[[Tensor, Tensor], Tensor],
+    *,
+    device: torch.device,
+    n_codes: int,
+    n_check: int,
+) -> CodeCheck:
+    # codes_of: (before, after) -> [B] long codes, a model's or a test's
+    # n_check fixed transitions (seeded), each guessed and set against the move
+    # it really shows
+    (frames=, positions=) = random_clips(
+        n_check, n_frames=2, generator=torch.Generator().manual_seed(0)
+    )
+    codes = codes_of(frames[:, 0].to(device), frames[:, 1].to(device)).cpu()  # [n]
+    moves = effect(positions[:, 0], positions[:, 1])  # [n]
+    table = code_table(codes, moves, n_codes=, n_moves=N_ACTIONS)
+    return (
+        accuracy=code_accuracy(table),
+        n_used=int((table.sum(dim=1) > 0).sum()),
+        table=,
+    )
+
+
+def key_codes(table: Tensor) -> Tensor:
+    # table: [n_codes, N_ACTIONS]
+    # out: [N_ACTIONS], for each move the code the guesser gave it most often.
+    # Two moves can get the same code, and then control fails for one of them
+    return table.argmax(dim=0)
+
+
+def save_checkpoint(
+    path: Path,
+    model: LatentActionModel,
+    *,
+    latent_cfg: LatentConfig,
+    key_codes: Tensor,
+    step: int,
+    code_accuracy: float,
+) -> None:
+    # weights, the config that rebuilds the model, and the key-to-code
+    # translation, as a plain dict so weights_only loading accepts it; written
+    # aside, then renamed
+    ckpt = {
+        "model": model.state_dict(),
+        "latent_cfg": latent_cfg._asdict(),
+        "key_codes": key_codes,
+        "step": step,
+        "code_accuracy": code_accuracy,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    torch.save(ckpt, tmp)
+    tmp.replace(path)
+
+
+def train(
+    model: LatentActionModel,
+    *,
+    latent_cfg: LatentConfig,
+    train_cfg: LatentTrainConfig,
+    save_best: Path | None = None,
+) -> list[LatentEvalRow]:
+    (
+        batch_size=, schedule=, schedule=(max_steps=), grad_clip=, eval_interval=,
+        n_check=, unquantized_steps=,
+    ): Final = train_cfg
+    (n_codes=): Final = latent_cfg
+    device = next(model.parameters()).device
+    opt = torch.optim.AdamW(model.parameters(), lr=0.0, fused=device.type == "cuda")
+    # one fixed validation batch, so val loss is comparable
+    val_clips = random_clips(
+        256, n_frames=2, generator=torch.Generator().manual_seed(1)
+    )
+    val_frames = val_clips.frames.to(device)
+    history: list[LatentEvalRow] = []
+    best = (-1.0, -math.inf)  # (code accuracy, -val loss) of the best eval
+    loss_sum = torch.tensor(0.0, device=device)  # on the device, no sync per step
+    loss_steps = 0
+    start = time.perf_counter()
+
+    def eval_now(step: int, lr: float):
+        nonlocal best, loss_sum, loss_steps
+        quantized = step >= unquantized_steps
+        model.eval()
+        with torch.no_grad():
+            val_loss = pair_loss(model, val_frames, quantized=).item()
+        model.train()
+        codes = code_check(model.codes, device=, n_codes=, n_check=)
+        keys = key_codes(codes.table)
+        train_loss = (loss_sum / loss_steps).item() if loss_steps else math.nan
+        loss_sum = torch.tensor(0.0, device=device)
+        loss_steps = 0
+        history.append(
+            (
+                step=, lr=, train_loss=, val_loss=,
+                code_accuracy=codes.accuracy,
+                n_used=codes.n_used,
+            )
+        )
+        elapsed = time.perf_counter() - start
+        # codes that mean the moves win; at equal accuracy, the better
+        # predictor. Before the codebook is placed its codes mean nothing
+        is_best = quantized and (codes.accuracy, -val_loss) > best
+        print(
+            f"step {step:>5}  lr {lr:.1e}  train {train_loss:.5f}  val {val_loss:.5f}"
+            + f"  codes {codes.accuracy:6.1%} ({codes.n_used}/{n_codes} used,"
+            + f" keys -> {keys.tolist()})  {elapsed / 60:4.1f}m"
+            + ("" if quantized else "  unquantized")
+            + ("  *" if is_best else ""),
+            flush=True,
+        )
+        if is_best:
+            best = (codes.accuracy, -val_loss)
+            if save_best is not None:
+                save_checkpoint(
+                    save_best, model, latent_cfg=, key_codes=keys,
+                    step=, code_accuracy=codes.accuracy,
+                )
+
+    model.train()
+    lr = lr_at(0, schedule=)
+    for step in range(max_steps):
+        lr = lr_at(step, schedule=)
+        for group in opt.param_groups:
+            group["lr"] = lr
+        if step == unquantized_steps:
+            # fresh transitions, seeded, so a rerun places the same codebook
+            (frames=) = random_clips(
+                N_PLACE, n_frames=2, generator=torch.Generator().manual_seed(2)
+            )
+            place_frames = frames.to(device)
+            place_codes(
+                model, place_frames[:, 0], place_frames[:, 1],
+                generator=torch.Generator().manual_seed(0),
+            )
+            print("  codebook placed on the clumps of z", flush=True)
+        if step % eval_interval == 0:
+            eval_now(step, lr)
+        (frames=) = random_clips(batch_size, n_frames=2)
+        loss = pair_loss(model, frames.to(device), quantized=step >= unquantized_steps)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        opt.step()
+        loss_sum += loss.detach()
+        loss_steps += 1
+    eval_now(max_steps, lr)
+    print("code table, rows are codes, columns are moves (noop up down left right)")
+    print(code_check(model.codes, device=, n_codes=, n_check=).table)
+    return history
+
+
+if __name__ == "__main__":
+    import sys
+
+    from paths import CKPT_DIR, LOG_DIR
+
+    # more codes than the 5 moves, so no two moves are forced to share one;
+    # spare codes take odd cases or stay unused
+    N_CODES = int(sys.argv[1]) if len(sys.argv) > 1 else 8
+    # names the checkpoint and the log, so runs never overwrite each other
+    RUN_NAME = f"latent_k{N_CODES}"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = open(LOG_DIR / f"{RUN_NAME}.log", "w")
+    sys.stdout = Tee(sys.stdout, log)  # sys.stdout is still the terminal here
+    torch.manual_seed(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    latent_cfg: LatentConfig = (
+        frame_channels=3, n_codes=N_CODES, guesser_channels=(32, 64, 128),
+        predictor_channels=(32, 64, 64), code_dim=2, groups=8,
+    )
+    train_cfg: LatentTrainConfig = (
+        batch_size=64,
+        schedule=(warmup_steps=100, max_steps=2000, max_lr=5e-4, min_lr=5e-5),
+        grad_clip=1.0,
+        eval_interval=100,
+        n_check=1000,
+        unquantized_steps=500,  # by then the moves sit in separate clumps
+    )
+    model = LatentActionModel(latent_cfg).to(device)
+    for name, part in (("guesser", model.guesser), ("predictor", model.predictor)):
+        n_params = sum(p.numel() for p in part.parameters())
+        print(f"{name}: {n_params / 1e6:.2f}M params")
+    train(model, latent_cfg=, train_cfg=, save_best=CKPT_DIR / f"{RUN_NAME}.pt")
+    print("\n------ FINISHED ------")
