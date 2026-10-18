@@ -3,6 +3,7 @@
 # artifacts/samples/<run>.png. A clean model's error maps are black
 #   uv run byname run src/show_world.pyn world_lr5e-4
 import sys
+from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -24,7 +25,9 @@ SAMPLE_STEPS = 20
 MAX_SHOWN_ERROR = 0.2  # error maps saturate here; colours span 2
 
 
-def load_model(path) -> (model: UNet, step: int, accuracy: float, pixel_error: float):
+def load_model(
+    path: Path,
+) -> (model: UNet, step: int, accuracy: float, pixel_error: float):
     # rebuilds the UNet from the checkpoint's own config, in eval mode on CPU
     ckpt: dict[str, Any] = torch.load(path, weights_only=True, map_location="cpu")
     unet_cfg = record(UNetConfig, ckpt["unet_cfg"])
@@ -57,20 +60,19 @@ if __name__ == "__main__":
     axes: np.ndarray  # [N_STARTS, columns] of Axes
     fig, axes = plt.subplots(N_STARTS, columns, figsize=(2 * columns, 2 * N_STARTS))
     for b in range(N_STARTS):
-        axes[b, 0].imshow(as_image(frames[b, -1]))
-        axes[b, 0].set_title("last frame", fontsize=8)
+        row: list[Axes] = list(axes[b])
+        row[0].imshow(as_image(frames[b, -1]))
+        row[0].set_title("last frame", fontsize=8)
         for a in range(N_ACTIONS):
             action = torch.tensor([a])
             drawn = next_frame(model, frames[b : b + 1], action, steps=SAMPLE_STEPS)[0]
             true = render(world.step(positions[b : b + 1, -1], action))[0]
             error_map = (drawn - true).abs().mean(dim=0)  # [H, W]
             name = ACTION_NAMES[a]
-            axes[b, 1 + 2 * a].imshow(as_image(drawn))
-            axes[b, 1 + 2 * a].set_title(f"{name}: drawn", fontsize=8)
-            axes[b, 2 + 2 * a].imshow(
-                error_map, vmin=0, vmax=MAX_SHOWN_ERROR, cmap="magma"
-            )
-            axes[b, 2 + 2 * a].set_title(f"{name}: |drawn - true|", fontsize=8)
+            row[1 + 2 * a].imshow(as_image(drawn))
+            row[1 + 2 * a].set_title(f"{name}: drawn", fontsize=8)
+            row[2 + 2 * a].imshow(error_map, vmin=0, vmax=MAX_SHOWN_ERROR, cmap="magma")
+            row[2 + 2 * a].set_title(f"{name}: |drawn - true|", fontsize=8)
     ax: Axes
     for ax in axes.flat:
         ax.set_xticks([])

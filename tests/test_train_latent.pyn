@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 import torch
+from torch import Tensor
 
 from latent_action import LatentActionModel, LatentConfig
 from oracle import PerfectGuesser
@@ -57,4 +58,5 @@ def test_a_short_run_logs_every_eval_and_saves_the_best(
     assert [row.step for row in history] == [0, 2, 4]
     saved: dict[str, Any] = torch.load(ckpt, weights_only=True)
     assert saved["latent_cfg"] == latent_cfg._asdict()
-    assert saved["key_codes"].shape == (N_ACTIONS,)
+    codes: Tensor = saved["key_codes"]
+    assert codes.shape == (N_ACTIONS,)
