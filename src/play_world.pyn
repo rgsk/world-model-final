@@ -71,6 +71,7 @@ if __name__ == "__main__":
     matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
     from matplotlib.axes import Axes
+    from matplotlib.backend_bases import KeyEvent
 
     from paths import CKPT_DIR
     from show_world import as_image, load_model
@@ -113,7 +114,7 @@ if __name__ == "__main__":
         )
         fig.canvas.draw_idle()
 
-    def on_key(event) -> None:
+    def on_key(event: KeyEvent) -> None:
         global game, presses
         if event.key == "r":
             game = start(n_context=model.n_context)
