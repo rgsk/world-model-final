@@ -1,0 +1,127 @@
+# playing the synthetic world through a trained model. Each key press draws the
+# next frame from the model's own last frames, so from the first press on it
+# reads its own drawings, never the world's. The true world runs alongside on
+# the same keys, so drift (the square in the wrong place, or blurring) is
+# measured exactly after every press
+#   uv run byname run src/play_world.pyn world_lr5e-4
+# arrows move, space is noop, r restarts, q quits
+import torch
+from torch import Tensor, nn
+
+import world
+from sample import next_frame
+from world import SPRITE, random_clips, render, sprite_center
+
+# one game in progress: what the model has drawn, and the truth
+type Game = (
+    frames: Tensor,  # [K, 3, H, W], the model's last K frames, oldest first
+    position: Tensor,  # [2], (x, y) top-left of the square in the true world
+)
+type Drift = (
+    center_error: float,  # distance of the drawn square's centre from the truth, pixels
+    pixel_error: float,  # mean |drawn - true| per pixel, colours span 2
+)
+
+
+def start(*, n_context: int, generator: torch.Generator | None = None) -> Game:
+    # out: a random real clip of n_context frames, so the model starts from
+    # true frames, and the position its last frame shows
+    (frames=, positions=) = random_clips(1, n_frames=n_context, generator=)
+    return (frames=frames[0], position=positions[0, -1])
+
+
+def play(
+    model: nn.Module,
+    game: Game,
+    action: int,
+    *,
+    steps: int,
+    generator: torch.Generator | None = None,
+) -> Game:
+    # out: the game one key press later. The model's drawn frame replaces its
+    # oldest frame, and the true world takes the same action
+    (frames=, position=) = game
+    device: torch.device = next(model.parameters()).device
+    context = frames[None].to(device)  # [1, K, 3, H, W]
+    key = torch.tensor([action])
+    drawn = next_frame(
+        model, context, key.to(device), steps=, generator=
+    )  # [1, 3, H, W]
+    frames = torch.cat([frames[1:], drawn.cpu()])  # [K, 3, H, W]
+    position = world.step(position[None], key)[0]
+    return (frames=, position=)
+
+
+def drift(game: Game) -> Drift:
+    # out: how far the model's latest frame is from the true world's
+    (frames=, position=) = game
+    drawn = frames[-1:]  # [1, 3, H, W]
+    true = render(position[None])  # [1, 3, H, W]
+    true_center = position.float() + (SPRITE - 1) / 2  # [2]
+    center_error = (sprite_center(drawn)[0] - true_center).norm()
+    pixel_error = (drawn - true).abs().mean()
+    return (center_error=center_error.item(), pixel_error=pixel_error.item())
+
+
+if __name__ == "__main__":
+    import sys
+
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+
+    from paths import CKPT_DIR
+    from show_world import as_image, load_model
+    from world import ACTION_NAMES, DOWN, LEFT, NOOP, RIGHT, UP
+
+    SAMPLE_STEPS = 20  # Euler steps per frame, as in training's control check
+    KEYS = {"up": UP, "down": DOWN, "left": LEFT, "right": RIGHT, " ": NOOP}
+
+    run = sys.argv[1]
+    (model=, step=, accuracy=) = load_model(CKPT_DIR / f"{run}.pt")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    print(f"{run}: step {step}, control {accuracy:.1%}, on {device}")
+
+    # matplotlib binds arrows and r to its toolbar; only q stays, to quit
+    for name in plt.rcParams:
+        if name.startswith("keymap.") and name != "keymap.quit":
+            plt.rcParams[name] = []
+
+    game = start(n_context=model.n_context)
+    presses = 0
+    fig, (model_ax, true_ax) = plt.subplots(1, 2, figsize=(9, 5))
+    model_image = model_ax.imshow(as_image(game.frames[-1]))
+    true_image = true_ax.imshow(as_image(render(game.position[None])[0]))
+    true_ax.set_title("true world")
+    for ax in (model_ax, true_ax):
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    def show(last_key: str) -> None:
+        (center_error=, pixel_error=) = drift(game)
+        model_image.set_data(as_image(game.frames[-1]))
+        true_image.set_data(as_image(render(game.position[None])[0]))
+        model_ax.set_title(f"model, press {presses}: {last_key}")
+        fig.suptitle(
+            f"drift: square off by {center_error:.2f} px, pixels off by "
+            f"{pixel_error:.4f}\narrows move, space is noop, r restarts, q quits"
+        )
+        fig.canvas.draw_idle()
+
+    def on_key(event) -> None:
+        global game, presses
+        if event.key == "r":
+            game = start(n_context=model.n_context)
+            presses = 0
+            show("restart")
+        elif event.key in KEYS:
+            action = KEYS[event.key]
+            game = play(model, game, action, steps=SAMPLE_STEPS)
+            presses += 1
+            show(ACTION_NAMES[action])
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    show("start")
+    plt.show()

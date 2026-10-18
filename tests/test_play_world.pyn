@@ -1,0 +1,53 @@
+# playing: each press slides the model's frames along by one drawn frame, and
+# drift compares that drawing with the true world. A perfect model never
+# drifts over a long game; one that ignores the keys drifts on the first move
+import torch
+
+from oracle import Oracle
+from play_world import Game, drift, play, start
+from world import N_ACTIONS, NOOP, RIGHT, STEP, render
+
+N_CONTEXT = 2
+SAMPLE_STEPS = 4  # the oracle's exact velocity lands on the frame at any count
+MIDDLE = (27, 27)  # far from every wall
+
+
+def game_at(x: int, y: int) -> Game:
+    # a game whose square has stood still at (x, y) for all N_CONTEXT frames
+    position = torch.tensor([x, y])
+    frames = render(position[None]).expand(N_CONTEXT, -1, -1, -1)
+    return (frames=, position=)
+
+
+def test_a_game_starts_on_the_true_world():
+    game = start(n_context=N_CONTEXT)
+    K, C, H, W = game.frames.shape
+    assert K == N_CONTEXT
+    assert drift(game) == (center_error=0.0, pixel_error=0.0)
+
+
+def test_a_press_drops_the_oldest_frame_and_adds_a_drawn_one():
+    game = start(n_context=N_CONTEXT)
+    after = play(Oracle(), game, RIGHT, steps=SAMPLE_STEPS)
+    assert after.frames.shape == game.frames.shape
+    assert torch.equal(after.frames[:-1], game.frames[1:])
+
+
+def test_a_perfect_model_never_drifts():
+    game: Game = start(n_context=N_CONTEXT)
+    presses = torch.randint(0, N_ACTIONS, (50,)).tolist()  # walls included
+    for action in presses:
+        game = play(Oracle(), game, action, steps=SAMPLE_STEPS)
+        (center_error=, pixel_error=) = drift(game)
+        assert center_error < 1e-3
+        assert pixel_error < 1e-5
+
+
+def test_a_model_that_ignores_the_keys_drifts_on_the_first_move():
+    game = game_at(*MIDDLE)
+    stuck = Oracle(ignore_action=True)
+    noop = play(stuck, game, NOOP, steps=SAMPLE_STEPS)
+    assert drift(noop).center_error < 1e-3  # right by luck, noop is all it does
+    # the true square moves STEP, the drawn one stays
+    moved = play(stuck, game, RIGHT, steps=SAMPLE_STEPS)
+    assert abs(drift(moved).center_error - STEP) < 1e-3
