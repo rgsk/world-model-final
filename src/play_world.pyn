@@ -41,7 +41,7 @@ def play(
     # out: the game one key press later. The model's drawn frame replaces its
     # oldest frame, and the true world takes the same action
     (frames=, position=) = game
-    device: torch.device = next(model.parameters()).device
+    device = next(model.parameters()).device
     context = frames[None].to(device)  # [1, K, 3, H, W]
     key = torch.tensor([action])
     drawn = next_frame(
@@ -70,6 +70,7 @@ if __name__ == "__main__":
 
     matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
+    from matplotlib.axes import Axes
 
     from paths import CKPT_DIR
     from show_world import as_image, load_model
@@ -91,6 +92,8 @@ if __name__ == "__main__":
 
     game = start(n_context=model.n_context)
     presses = 0
+    model_ax: Axes
+    true_ax: Axes
     fig, (model_ax, true_ax) = plt.subplots(1, 2, figsize=(9, 5))
     model_image = model_ax.imshow(as_image(game.frames[-1]))
     true_image = true_ax.imshow(as_image(render(game.position[None])[0]))

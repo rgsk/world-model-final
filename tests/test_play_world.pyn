@@ -2,8 +2,8 @@
 # drift compares that drawing with the true world. A perfect model never
 # drifts over a long game; one that ignores the keys drifts on the first move
 import torch
-
 from oracle import Oracle
+
 from play_world import Game, drift, play, start
 from world import N_ACTIONS, NOOP, RIGHT, STEP, render
 
@@ -35,7 +35,7 @@ def test_a_press_drops_the_oldest_frame_and_adds_a_drawn_one():
 
 def test_a_perfect_model_never_drifts():
     game: Game = start(n_context=N_CONTEXT)
-    presses = torch.randint(0, N_ACTIONS, (50,)).tolist()  # walls included
+    presses: list[int] = torch.randint(0, N_ACTIONS, (50,)).tolist()  # walls included
     for action in presses:
         game = play(Oracle(), game, action, steps=SAMPLE_STEPS)
         (center_error=, pixel_error=) = drift(game)

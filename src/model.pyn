@@ -155,7 +155,7 @@ class UNet(nn.Module):
         # action: [B], the action that leads from context's last frame to x0
         # out: [B, C, H, W], the predicted velocity
         B, K, C, H, W = context.shape
-        halvings = 2 ** (len(self.channels) - 1)
+        halvings: int = 2 ** (len(self.channels) - 1)
         assert H % halvings == 0 and W % halvings == 0, (
             f"H, W {H}x{W} must divide by {halvings} for {len(self.channels)} levels"
         )

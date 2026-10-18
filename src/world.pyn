@@ -89,15 +89,18 @@ def sprite_center(frames: Tensor) -> Tensor:
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.axes import Axes
 
     from paths import SAMPLES_DIR
 
     torch.manual_seed(0)
     (frames=, actions=) = random_clips(4, n_frames=8)
+    axes: np.ndarray  # [4, 8] of Axes
     fig, axes = plt.subplots(4, 8, figsize=(16, 8.5))
     for b in range(4):
         for t in range(8):
-            ax = axes[b, t]
+            ax: Axes = axes[b, t]
             ax.imshow((rearrange(frames[b, t], "C H W -> H W C") + 1) / 2)
             ax.set_xticks([])
             ax.set_yticks([])

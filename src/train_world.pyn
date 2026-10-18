@@ -106,7 +106,7 @@ def control_check(
     # and pixel by pixel (how clean it looks). The same states and the same
     # starting noise every call (both seeded), so a change between two checks
     # comes from the model alone
-    device: torch.device = next(model.parameters()).device
+    device = next(model.parameters()).device
     generator = torch.Generator().manual_seed(0)
     noise = torch.Generator(device=device).manual_seed(0)
     per_action: list[float] = []

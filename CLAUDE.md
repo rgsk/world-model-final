@@ -13,7 +13,14 @@ plus the action. `roadmap.md` has the plan and what's done.
 - `uv run pytest -q`
 - `uv run byname format <changed files>`
 - `uv run byname tool basedpyright src tests`
-- Don't use ruff or any_check.
+- `uv run annotation-check <changed .pyn files>` (from ../ml-tools)
+  - `name is Any` (or `unknown`, `partially unknown`): the name shows white in the editor. Annotate it
+    where it's first bound. A line with `# any:ok` is skipped.
+  - `T is Unknown to the checker`: the annotation itself is untyped. Fix the type, not the annotation.
+  - `T is inferred anyway`: a redundant annotation. Remove it, unless it's marked `# any:explicit`.
+    A name assigned again in its scope is never reported, because there the annotation guards those
+    assignments.
+- Don't use ruff check.
 
 ## Running
 - Plain Python can't import .pyn. Use `uv run byname run src/x.pyn`; notebooks need `%load_ext byname`.

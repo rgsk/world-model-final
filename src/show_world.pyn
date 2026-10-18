@@ -3,12 +3,14 @@
 # artifacts/samples/<run>.png. A clean model's error maps are black
 #   uv run byname run src/show_world.pyn world_lr5e-4
 import sys
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from byname import record
 from einops import rearrange
+from matplotlib.axes import Axes
 from torch import Tensor
 
 import world
@@ -24,7 +26,7 @@ MAX_SHOWN_ERROR = 0.2  # error maps saturate here; colours span 2
 
 def load_model(path) -> (model: UNet, step: int, accuracy: float, pixel_error: float):
     # rebuilds the UNet from the checkpoint's own config, in eval mode on CPU
-    ckpt = torch.load(path, weights_only=True, map_location="cpu")
+    ckpt: dict[str, Any] = torch.load(path, weights_only=True, map_location="cpu")
     unet_cfg = record(UNetConfig, ckpt["unet_cfg"])
     model = UNet(unet_cfg).eval()
     model.load_state_dict(ckpt["model"])
@@ -52,6 +54,7 @@ if __name__ == "__main__":
         N_STARTS, n_frames=model.n_context, generator=torch.Generator().manual_seed(3)
     )
     columns = 1 + 2 * N_ACTIONS
+    axes: np.ndarray  # [N_STARTS, columns] of Axes
     fig, axes = plt.subplots(N_STARTS, columns, figsize=(2 * columns, 2 * N_STARTS))
     for b in range(N_STARTS):
         axes[b, 0].imshow(as_image(frames[b, -1]))
@@ -68,6 +71,7 @@ if __name__ == "__main__":
                 error_map, vmin=0, vmax=MAX_SHOWN_ERROR, cmap="magma"
             )
             axes[b, 2 + 2 * a].set_title(f"{name}: |drawn - true|", fontsize=8)
+    ax: Axes
     for ax in axes.flat:
         ax.set_xticks([])
         ax.set_yticks([])
