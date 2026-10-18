@@ -1,5 +1,7 @@
 # the control check scores a perfect model 100% and an action-blind one low,
-# training batches are consistent, and a short run logs every eval
+# training batches are consistent, and a short run logs every eval. On guessed
+# codes (stage 2), each key becomes the code of its move, keys pressed as their
+# codes give full control and swapped ones don't, and a run trains on codes
 from pathlib import Path
 from typing import Any
 
@@ -7,10 +9,17 @@ import pytest
 import torch
 
 from model import UNet, UNetConfig
-from oracle import Oracle
-from train_world import Schedule, TrainConfig, control_check, lr_at, train, world_batch
+from torch import Tensor, nn
+
+from oracle import Oracle, PerfectGuesser, positions
+from train_world import (
+    KeyedModel, Latent, Schedule, TrainConfig, control_check, lr_at, relabel, train,
+    world_batch,
+)
 import world
-from world import N_ACTIONS, NOOP, SPRITE, render, sprite_center
+from world import (
+    DOWN, LEFT, N_ACTIONS, NOOP, RIGHT, SPRITE, UP, effect, render, sprite_center,
+)
 
 N_CONTEXT = 2
 N_CHECK = 50  # starting states per action
@@ -74,6 +83,79 @@ def test_a_short_run_logs_every_eval_and_saves_the_best(
     assert [row.step for row in history] == [0, 2, 4]
     saved: dict[str, Any] = torch.load(ckpt, weights_only=True)
     assert saved["unet_cfg"] == cfg._asdict()
+
+
+N_CODES = 7  # more codes than moves, as a latent action model has
+# the code a guesser might invent for each move: noop, up, down, left, right
+INVENTED = torch.tensor([4, 0, 6, 2, 1])
+
+
+@pytest.fixture
+def latent() -> Latent:
+    return (coder=PerfectGuesser(INVENTED), key_codes=INVENTED)
+
+
+def test_relabel_replaces_each_key_with_the_code_of_its_move(latent: Latent):
+    batch = world_batch(32, n_context=N_CONTEXT, device=torch.device("cpu"))
+    coded = relabel(batch, latent)
+    # a key pushed into a wall shows no move, so it gets noop's code
+    moves = effect(positions(batch.context[:, -1]), positions(batch.true_next))
+    assert torch.equal(coded.action, INVENTED[moves])
+    assert torch.equal(coded.context, batch.context)
+    assert torch.equal(coded.true_next, batch.true_next)
+
+
+class CodeReader(nn.Module):
+    # the oracle reading codes, as a UNet trained on INVENTED would. It turns
+    # each code back into its move first
+    moves: Tensor  # a buffer, so it moves with .to(device)
+
+    def __init__(self):
+        super().__init__()
+        self.oracle = Oracle()
+        moves = torch.zeros(N_CODES, dtype=torch.long)
+        moves[INVENTED] = torch.arange(N_ACTIONS)
+        self.register_buffer("moves", moves)  # [N_CODES], the move of each code
+
+    def forward(
+        self, x_t: Tensor, t: Tensor, context: Tensor, action: Tensor
+    ) -> Tensor:
+        # action: [B], codes
+        return self.oracle(x_t, t, context, self.moves[action])
+
+
+def test_keys_pressed_as_their_codes_give_full_control():
+    keyed = KeyedModel(CodeReader(), INVENTED)
+    (accuracy=) = control_check(
+        keyed, n_context=N_CONTEXT, n_check=N_CHECK, sample_steps=2
+    )
+    assert accuracy == 1.0
+
+
+def test_swapped_codes_move_the_square_the_wrong_way():
+    swapped = INVENTED.clone()
+    swapped[[LEFT, RIGHT]] = INVENTED[[RIGHT, LEFT]]
+    keyed = KeyedModel(CodeReader(), swapped)
+    (per_action=) = control_check(
+        keyed, n_context=N_CONTEXT, n_check=N_CHECK, sample_steps=2
+    )
+    assert per_action[NOOP] == per_action[UP] == per_action[DOWN] == 1.0
+    # only squares at a wall, where neither key moves them, come out right
+    assert per_action[LEFT] < 0.5 and per_action[RIGHT] < 0.5
+
+
+def test_a_short_run_on_codes_logs_every_eval(cfg: UNetConfig, latent: Latent):
+    train_cfg: TrainConfig = (
+        batch_size=4,
+        schedule=(warmup_steps=1, max_steps=4, max_lr=1e-3, min_lr=1e-4),
+        grad_clip=1.0,
+        eval_interval=2,
+        sample_steps=2,
+        n_check=4,
+    )
+    model = UNet(cfg._replace(n_actions=N_CODES))  # one action per code
+    history = train(model, train_cfg=, latent=)
+    assert [row.step for row in history] == [0, 2, 4]
 
 
 # steps 0 .. 99 run, with warmup on 0 .. 4 and decay on 5 .. 99

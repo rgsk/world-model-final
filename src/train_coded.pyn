@@ -1,0 +1,55 @@
+# stage 2 of learning actions from frames alone: the next-frame model trained
+# exactly as on the true keys, but each transition's action is the code a
+# frozen latent action model (from train_latent) gives it. The true keys only
+# score control, each pressed as the code the guesser gave its move
+#   uv run byname run src/train_coded.pyn latent_k8
+import sys
+from typing import Any
+
+import torch
+from byname import record
+
+from latent_action import LatentActionModel, LatentConfig
+from model import UNet, UNetConfig
+from paths import CKPT_DIR, LOG_DIR
+from train_world import Tee, TrainConfig, train
+
+latent_run = sys.argv[1]
+# names the checkpoint and the log, so runs never overwrite each other
+RUN_NAME = f"world_on_{latent_run}"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+log = open(LOG_DIR / f"{RUN_NAME}.log", "w")
+sys.stdout = Tee(sys.stdout, log)  # sys.stdout is still the terminal here
+torch.manual_seed(0)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+ckpt: dict[str, Any] = torch.load(
+    CKPT_DIR / f"{latent_run}.pt", weights_only=True, map_location=device
+)
+latent_cfg = record(LatentConfig, ckpt["latent_cfg"])
+latent_model = LatentActionModel(latent_cfg).to(device)
+latent_model.load_state_dict(ckpt["model"])
+latent_model.eval().requires_grad_(False)  # frozen, it only labels
+key_codes: torch.Tensor = ckpt["key_codes"]
+print(f"{latent_run}: codes {ckpt['code_accuracy']:.1%}, keys -> {key_codes.tolist()}")
+
+unet_cfg: UNetConfig = (
+    frame_channels=3, n_context=2, n_actions=latent_cfg.n_codes,
+    channels=(64, 128, 128), time_dim=256, groups=8,
+)
+train_cfg: TrainConfig = (
+    batch_size=64,
+    schedule=(warmup_steps=200, max_steps=4000, max_lr=5e-4, min_lr=5e-5),
+    grad_clip=1.0,
+    eval_interval=250,
+    sample_steps=20,
+    n_check=200,
+)
+model = UNet(unet_cfg).to(device)
+train(
+    model,
+    train_cfg=,
+    save_best=(path=CKPT_DIR / f"{RUN_NAME}.pt", unet_cfg=),
+    latent=(coder=latent_model, key_codes=),
+)
+print("\n------ FINISHED ------")

@@ -3,15 +3,17 @@
 # put the square, against the exact position world.step gives. A model that draws
 # sharp squares but ignores the action fails this check, as the earlier
 # project's MaskGIT model did. world.step is the world's rule; step alone is a
-# training step
+# training step. Given a trained latent action model, the actions are its codes
+# instead of the true keys (stage 2 of learning actions from frames alone), and
+# the control check presses each key as the code the guesser gave its move
 import math
 import time
 from pathlib import Path
-from typing import TextIO
+from typing import Protocol, TextIO
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 from flow import flow_batch
 from model import UNet, UNetConfig
@@ -29,6 +31,17 @@ type TrainConfig = (
     sample_steps: int,  # Euler steps per drawn frame in the control check
     n_check: int,  # starting states per action in the control check
 )
+
+
+class Coder(Protocol):
+    # anything that labels transitions with codes, a frozen latent action model
+    # or a test's. A protocol, not a Callable field, because byname rejects a
+    # record literal holding a function when written in another module
+    def codes(self, before: Tensor, after: Tensor) -> Tensor: ...
+
+
+# the codes that replace the true keys, and the code each key stands for
+type Latent = (coder: Coder, key_codes: Tensor)  # key_codes: [N_ACTIONS]
 # a training example: the context frames, the action, and the frame it leads to
 type WorldBatch = (context: Tensor, action: Tensor, true_next: Tensor)
 type Control = (
@@ -82,6 +95,34 @@ def world_batch(
         action=actions[:, -1].to(device),
         true_next=frames[:, -1].to(device),
     )
+
+
+def relabel(batch: WorldBatch, latent: Latent) -> WorldBatch:
+    # out: the batch with each true key replaced by the guesser's code for the
+    # move from the last context frame to the next frame
+    (context=, true_next=) = batch
+    code = latent.coder.codes(context[:, -1], true_next)  # [B]
+    return batch._replace(action=code.to(context.device))
+
+
+class KeyedModel(nn.Module):
+    # a UNet trained on codes, driven by keys, so control_check and play can
+    # press them. Each key becomes its code
+    key_codes: Tensor  # a buffer, so it moves with .to(device)
+
+    def __init__(self, unet: nn.Module, key_codes: Tensor):
+        super().__init__()
+        # unet: called as unet(x_t, t, context, code), a UNet or a test's oracle
+        # key_codes: [N_ACTIONS], the code each key stands for
+        self.unet = unet
+        self.register_buffer("key_codes", key_codes)
+
+    def forward(
+        self, x_t: Tensor, t: Tensor, context: Tensor, action: Tensor
+    ) -> Tensor:
+        # action: [B], keys
+        # out: [B, C, H, W], the UNet's velocity for each key's code
+        return self.unet(x_t, t, context, self.key_codes[action])
 
 
 def batch_loss(
@@ -167,6 +208,7 @@ def train(
     *,
     train_cfg: TrainConfig,
     save_best: (path: Path, unet_cfg: UNetConfig) | None = None,
+    latent: Latent | None = None,
 ) -> list[EvalRow]:
     (
         batch_size=, schedule=, grad_clip=, eval_interval=,
@@ -180,6 +222,10 @@ def train(
     val_batch = world_batch(
         256, n_context=, device=, generator=torch.Generator().manual_seed(1)
     )
+    if latent is not None:
+        val_batch = relabel(val_batch, latent)
+    # what the control check presses keys on
+    keyed = model if latent is None else KeyedModel(model, latent.key_codes.to(device))
     history: list[EvalRow] = []
     best = (-1.0, -math.inf)  # (control accuracy, -pixel error) of the best eval
     loss_sum = torch.tensor(0.0, device=device)  # on the device, no sync per step
@@ -194,7 +240,7 @@ def train(
             val_loss = batch_loss(model, val_batch, generator=val_noise).item()
         model.train()
         (accuracy=, per_action=, center_error=, pixel_error=) = (
-            control_check(model, n_context=, n_check=, sample_steps=)
+            control_check(keyed, n_context=, n_check=, sample_steps=)
         )
         train_loss = (loss_sum / loss_steps).item() if loss_steps else math.nan
         loss_sum = torch.tensor(0.0, device=device)
@@ -240,6 +286,8 @@ def train(
         if step % eval_interval == 0:
             eval_now(step, lr)
         batch = world_batch(batch_size, n_context=, device=)
+        if latent is not None:
+            batch = relabel(batch, latent)
         loss = batch_loss(model, batch)
         opt.zero_grad()
         loss.backward()
